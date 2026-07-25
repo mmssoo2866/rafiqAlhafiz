@@ -61,14 +61,17 @@ export default function App() {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [searchSurahId, setSearchSurahId] = useState<number>(1);
 
-  const QURAN_CACHE_NAME = "quran-images-v1";
+  const QURAN_CACHE_NAME = "quran-images-v2";
+
+  /** عنوان صورة صفحة المصحف — يمر عبر بروكسي الخادم لتجنب حجب CORS */
+  const quranPageUrl = (page: number) =>
+    `/api/quran-image/${page}`;
 
   // Check if page is cached
   const checkCacheStatus = async (page: number) => {
     try {
       const cache = await caches.open(QURAN_CACHE_NAME);
-      const url = `https://android.quran.com/data/single_page/images_1920/page${String(page).padStart(3, "0")}.png`;
-      const response = await cache.match(url);
+      const response = await cache.match(quranPageUrl(page));
       setIsCached(!!response);
     } catch (e) {
       setIsCached(false);
@@ -103,8 +106,10 @@ export default function App() {
       const cache = await caches.open(QURAN_CACHE_NAME);
       let count = 0;
       for (const page of pagesToDownload) {
-        const url = `https://android.quran.com/data/single_page/images_1920/page${String(page).padStart(3, "0")}.png`;
-        await cache.add(url);
+        const url = quranPageUrl(page);
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        await cache.put(url, resp);
         count++;
         setDownloadProgress(Math.round((count / pagesToDownload.length) * 100));
       }
@@ -1434,7 +1439,7 @@ export default function App() {
                       ) : (
                         <img
                           id="mushaf-img"
-                          src={`https://android.quran.com/data/single_page/images_1920/page${String(mushafPage).padStart(3, "0")}.png`}
+                          src={quranPageUrl(mushafPage)}
                           alt={`Quran Page ${mushafPage}`}
                           className={`max-h-[75vh] w-auto object-contain mx-auto select-none pointer-events-none transition-opacity duration-500 ${imageLoading ? 'opacity-0' : 'opacity-100'}`}
                           onLoad={() => {
