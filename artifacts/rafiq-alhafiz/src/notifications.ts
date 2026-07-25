@@ -1,15 +1,23 @@
 /**
- * Notifications — إشعارات رفيق الحافظ
+ * Notifications — إشعارات رفيق الحافظ (نسخة ويب)
  *
- * إصلاح: استخدام Web Notifications API القياسية بدلاً من
- * @capacitor/local-notifications التي لا تعمل في بيئة الويب.
- * عند استخدام التطبيق على أندرويد (Capacitor) يمكن استبدال
- * هذه الدوال بنسختها الأصلية.
+ * يستخدم Web Notifications API القياسية.
+ * ملاحظة: الإشعارات تحتاج إذناً وتعمل فقط في تبويب متصفح مستقل،
+ * وليس داخل iframe مضمّن (مثل معاينة Replit).
  */
+
+/** هل التطبيق مفتوح داخل iframe؟ */
+const isInIframe = (): boolean => {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true; // cross-origin iframe
+  }
+};
 
 export async function requestNotificationPermission(): Promise<void> {
   try {
-    if (!("Notification" in window)) return;
+    if (!("Notification" in window) || isInIframe()) return;
     if (Notification.permission === "default") {
       await Notification.requestPermission();
     }
@@ -18,31 +26,43 @@ export async function requestNotificationPermission(): Promise<void> {
   }
 }
 
-export async function sendTestNotification(): Promise<void> {
+/**
+ * يرسل إشعاراً تجريبياً.
+ * @returns رسالة نصية توضح ما حدث (نجاح أو سبب الفشل)
+ */
+export async function sendTestNotification(): Promise<string> {
   try {
-    if (!("Notification" in window)) {
-      alert("متصفحك لا يدعم الإشعارات.");
-      return;
+    // الحالة 1: داخل iframe — الإشعارات محظورة بواسطة المتصفح
+    if (isInIframe()) {
+      return "iframe";
     }
 
+    // الحالة 2: المتصفح لا يدعم الإشعارات
+    if (!("Notification" in window)) {
+      return "unsupported";
+    }
+
+    // الحالة 3: اطلب الإذن إذا لم يُمنح بعد
     if (Notification.permission === "default") {
       const permission = await Notification.requestPermission();
       if (permission !== "granted") {
-        alert("يرجى السماح بالإشعارات من إعدادات المتصفح.");
-        return;
+        return "denied";
       }
     }
 
+    // الحالة 4: الإذن ممنوح — أرسل الإشعار
     if (Notification.permission === "granted") {
-      new Notification("تجربة رفيق الحافظ 📖", {
-        body: "إذا ظهر هذا التنبيه، فهذا يعني أن نظام الإشعارات يعمل بنجاح!",
+      new Notification("رفيق الحافظ 📖", {
+        body: "إذا ظهر هذا التنبيه فنظام الإشعارات يعمل بنجاح!",
         icon: "/icon.png",
       });
-    } else {
-      alert("الإشعارات محظورة في إعدادات متصفحك.");
+      return "sent";
     }
+
+    return "denied";
   } catch (e) {
     console.warn("Failed to send test notification:", e);
+    return "error";
   }
 }
 
@@ -53,6 +73,7 @@ export async function scheduleReviewReminder(
   date: Date
 ): Promise<void> {
   try {
+    if (isInIframe()) return;
     if (!("Notification" in window) || Notification.permission !== "granted")
       return;
 

@@ -67,7 +67,7 @@ export default function App() {
   const checkCacheStatus = async (page: number) => {
     try {
       const cache = await caches.open(QURAN_CACHE_NAME);
-      const url = `https://cdn.islamic.network/quran/images/high-resolution/page${String(page).padStart(3, "0")}.png`;
+      const url = `https://android.quran.com/data/single_page/images_1920/page${String(page).padStart(3, "0")}.png`;
       const response = await cache.match(url);
       setIsCached(!!response);
     } catch (e) {
@@ -103,7 +103,7 @@ export default function App() {
       const cache = await caches.open(QURAN_CACHE_NAME);
       let count = 0;
       for (const page of pagesToDownload) {
-        const url = `https://cdn.islamic.network/quran/images/high-resolution/page${String(page).padStart(3, "0")}.png`;
+        const url = `https://android.quran.com/data/single_page/images_1920/page${String(page).padStart(3, "0")}.png`;
         await cache.add(url);
         count++;
         setDownloadProgress(Math.round((count / pagesToDownload.length) * 100));
@@ -1434,24 +1434,16 @@ export default function App() {
                       ) : (
                         <img
                           id="mushaf-img"
-                          crossOrigin="anonymous"
-                          src={`https://cdn.islamic.network/quran/images/high-resolution/page${String(mushafPage).padStart(3, "0")}.png`}
+                          src={`https://android.quran.com/data/single_page/images_1920/page${String(mushafPage).padStart(3, "0")}.png`}
                           alt={`Quran Page ${mushafPage}`}
                           className={`max-h-[75vh] w-auto object-contain mx-auto select-none pointer-events-none transition-opacity duration-500 ${imageLoading ? 'opacity-0' : 'opacity-100'}`}
                           onLoad={() => {
                             setImageLoading(false);
                             checkCacheStatus(mushafPage);
                           }}
-                          onError={(e) => {
-                            // Fallback to secondary CDN if primary fails
-                            const img = e.currentTarget;
-                            if (!img.dataset.fallback) {
-                              img.dataset.fallback = "1";
-                              img.src = `https://quran.ksu.edu.sa/img/30/page${String(mushafPage).padStart(3, "0")}.png`;
-                            } else {
-                              setImageLoading(false);
-                              setImageError(true);
-                            }
+                          onError={() => {
+                            setImageLoading(false);
+                            setImageError(true);
                           }}
                         />
                       )}
@@ -1635,14 +1627,31 @@ export default function App() {
                   <div className="pt-4 border-t border-gray-100">
                     <h4 className="text-sm font-bold text-gray-700 mb-2">🔔 تجربة النظام</h4>
                     <button
-                      onClick={() => {
-                        sendTestNotification();
-                        alert("تم إرسال إشعار تجريبي! سيظهر خلال ثانية واحدة.");
+                      onClick={async () => {
+                        const result = await sendTestNotification();
+                        if (result === "sent") {
+                          alert("✅ تم إرسال الإشعار! ابحث عنه في منطقة الإشعارات.");
+                        } else if (result === "iframe") {
+                          alert(
+                            "⚠️ الإشعارات لا تعمل في نافذة المعاينة المضمّنة.\n\n" +
+                            "افتح التطبيق في تبويب متصفح مستقل ثم جرّب مجدداً.\n" +
+                            "(انقر على زر فتح في نافذة جديدة أعلى المعاينة)"
+                          );
+                        } else if (result === "denied") {
+                          alert(
+                            "🔕 الإشعارات محظورة.\n\n" +
+                            "انقر على أيقونة القفل بجانب رابط الصفحة في المتصفح، وأعطِ إذن الإشعارات."
+                          );
+                        } else if (result === "unsupported") {
+                          alert("❌ متصفحك لا يدعم الإشعارات. جرّب Chrome أو Edge.");
+                        } else {
+                          alert("❌ فشل إرسال الإشعار. يرجى المحاولة مرة أخرى.");
+                        }
                       }}
                       className="w-full py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 border border-blue-200"
                     >
                       <Bell className="w-4 h-4" />
-                      إرسال إشعار تجريبي للهاتف
+                      تجربة الإشعارات
                     </button>
                   </div>
 
