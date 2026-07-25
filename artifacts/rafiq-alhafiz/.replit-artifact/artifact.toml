@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "رفيق الحافظ"
+version = "1.0.0"
+id = "artifacts/rafiq-alhafiz"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19780
+
+[services.development]
+run = "pnpm --filter @workspace/rafiq-alhafiz run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/rafiq-alhafiz", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/rafiq-alhafiz/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19780"
+BASE_PATH = "/"
