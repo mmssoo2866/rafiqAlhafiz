@@ -1,0 +1,6 @@
+{
+  "name": "رفيق الحافظ",
+  "description": "تطبيق ذكي ومبتكر لحفظ ومراجعة القرآن الكريم بالتكرار المتباعد والربط مع الصلوات والركعات ومواقيت الأذان",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
