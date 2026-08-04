@@ -13,6 +13,8 @@ import {
   Plus, 
   Search, 
   Bell, 
+  BellRing,
+  BellOff,
   ChevronLeft, 
   ChevronRight, 
   Info, 
@@ -22,15 +24,39 @@ import {
   RotateCcw, 
   Check, 
   Activity, 
-  AlertCircle 
+  AlertCircle,
+  Moon,
+  Sun 
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
-import { SURAHS, getSurahById, getPageForAyah, getSurahName } from "./quranData";
+import { SURAHS, getSurahById, getPageForAyah, getSurahName, getSurahForPage } from "./quranData";
 import { loadAppState, saveAppState, logActivity, AppState, MemorizationBlock, UserProfile, CompletedReviews } from "./storage";
 import { getTasksForDate, getCumulativeGroups, hasDay66TriggerToday, ScheduledTask } from "./scheduler";
-import { calculateTodayPrayers, distributeReviewsToPrayers, DistributedSlot } from "./prayerEngine";
-import { requestNotificationPermission, sendTestNotification } from "./notifications";
+import { calculateTodayPrayers, distributeReviewsToPrayers, distributeKhatmahReviewToPrayers, DistributedSlot } from "./prayerEngine";
+
+const QURAN_PAGE_CDNS = [
+  (page: number) => `https://raw.githubusercontent.com/Quran/quran.com-images/master/images_1920/page${String(page).padStart(3, "0")}.png`,
+  (page: number) => `https://everyayah.com/data/quranpages/page${String(page).padStart(3, "0")}.png`,
+  (page: number) => `https://cdn.islamic.network/quran/images/high-resolution/page${page}.png`,
+  (page: number) => `https://android.quran.com/data/single_page/images_1920/page${String(page).padStart(3, "0")}.png`
+];
+
+const PRAYER_KEY_MAP: Record<string, "fajr" | "dhuhr" | "asr" | "maghrib" | "isha"> = {
+  "الفجر": "fajr",
+  "الظهر": "dhuhr",
+  "العصر": "asr",
+  "المغرب": "maghrib",
+  "العشاء": "isha"
+};
+
+function getPrayerOffsetMinutes(profile: UserProfile, prayerArabicName: string): number {
+  const key = PRAYER_KEY_MAP[prayerArabicName];
+  if (key && profile.prayerReminderOffsets && profile.prayerReminderOffsets[key] !== undefined) {
+    return profile.prayerReminderOffsets[key]!;
+  }
+  return profile.prayerReminderOffsetMinutes ?? 15;
+}
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
@@ -39,11 +65,17 @@ export default function App() {
   
   // Geolocation loading state
   const [gpsLoading, setGpsLoading] = useState(false);
+
+  // Notification permission state
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>(
+    typeof window !== "undefined" && "Notification" in window ? Notification.permission : "default"
+  );
   
   // Onboarding wizard if active
   const [isOnboarding, setIsOnboarding] = useState(false);
   
   // Form states
+  const [deletingBlockId, setDeletingBlockId] = useState<string | null>(null);
   const [newHifz, setNewHifz] = useState({
     surahId: 67, // Al-Mulk default
     fromAyah: 1,
@@ -54,82 +86,54 @@ export default function App() {
   // Mushaf viewer state
   const [mushafPage, setMushafPage] = useState<number>(1);
   const [mushafViewMode, setMushafViewMode] = useState<"image" | "offline">("image");
-  const [imageLoading, setImageLoading] = useState(false);
-  const [imageError, setImageError] = useState(false);
-  const [isCached, setIsCached] = useState(false);
-  const [downloadingSurah, setDownloadingSurah] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
   const [searchSurahId, setSearchSurahId] = useState<number>(1);
+  const [mushafCdnIndex, setMushafCdnIndex] = useState<number>(0);
+  const [mushafImgLoading, setMushafImgLoading] = useState<boolean>(true);
+  const [mushafImgFailed, setMushafImgFailed] = useState<boolean>(false);
+  const [pageTextData, setPageTextData] = useState<{ surahName: string; ayahs: { numberInSurah: number; text: string }[] } | null>(null);
+  const [loadingPageText, setLoadingPageText] = useState<boolean>(false);
 
-  const QURAN_CACHE_NAME = "quran-images-v2";
-
-  /** عنوان صورة صفحة المصحف — يمر عبر بروكسي الخادم لتجنب حجب CORS */
-  const quranPageUrl = (page: number) =>
-    `/api/quran-image/${page}`;
-
-  // Check if page is cached
-  const checkCacheStatus = async (page: number) => {
-    try {
-      const cache = await caches.open(QURAN_CACHE_NAME);
-      const response = await cache.match(quranPageUrl(page));
-      setIsCached(!!response);
-    } catch (e) {
-      setIsCached(false);
-    }
-  };
-
-  // Trigger loading state and cache check when page changes
+  // Reset image states on page change
   useEffect(() => {
-    if (activeTab === "mushaf" && mushafViewMode === "image") {
-      setImageLoading(true);
-      setImageError(false);
-      checkCacheStatus(mushafPage);
+    setMushafCdnIndex(0);
+    setMushafImgLoading(true);
+    setMushafImgFailed(false);
+  }, [mushafPage]);
+
+  // Fetch digital page text when offline mode or failover occurs
+  useEffect(() => {
+    if (mushafViewMode !== "offline" && !mushafImgFailed) {
+      return;
     }
-  }, [mushafPage, mushafViewMode, activeTab]);
-
-  // Function to download a surah for offline use
-  const handleDownloadSurah = async () => {
-    const surah = getSurahById(searchSurahId);
-    if (!surah) return;
-
-    const nextSurah = getSurahById(searchSurahId + 1);
-    const endPage = nextSurah ? nextSurah.startPage - 1 : 604;
-    const pagesToDownload = Array.from(
-      { length: endPage - surah.startPage + 1 },
-      (_, i) => surah.startPage + i
-    );
-
-    setDownloadingSurah(true);
-    setDownloadProgress(0);
-
-    try {
-      const cache = await caches.open(QURAN_CACHE_NAME);
-      let count = 0;
-      for (const page of pagesToDownload) {
-        const url = quranPageUrl(page);
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        await cache.put(url, resp);
-        count++;
-        setDownloadProgress(Math.round((count / pagesToDownload.length) * 100));
-      }
-      alert(`تم تحميل سورة ${surah.name} بنجاح للأوفلاين!`);
-      checkCacheStatus(mushafPage);
-    } catch (error) {
-      alert("فشل التحميل. يرجى التأكد من اتصالك بالإنترنت.");
-    } finally {
-      setDownloadingSurah(false);
-    }
-  };
+    let isMounted = true;
+    setLoadingPageText(true);
+    fetch(`https://api.alquran.cloud/v1/page/${mushafPage}/quran-uthmani`)
+      .then(res => res.json())
+      .then(data => {
+        if (isMounted && data?.data?.ayahs) {
+          const ayahs = data.data.ayahs.map((a: any) => ({
+            numberInSurah: a.numberInSurah,
+            text: a.text,
+            surahName: a.surah?.name || ""
+          }));
+          const primarySurah = data.data.ayahs[0]?.surah?.name || "القرآن الكريم";
+          setPageTextData({ surahName: primarySurah, ayahs });
+        }
+      })
+      .catch(() => {
+        if (isMounted) setPageTextData(null);
+      })
+      .finally(() => {
+        if (isMounted) setLoadingPageText(false);
+      });
+    return () => { isMounted = false; };
+  }, [mushafPage, mushafViewMode, mushafImgFailed]);
 
   // Setup today's initial date 
   useEffect(() => {
     const today = new Date();
     setTodayStr(today.toISOString().split("T")[0]);
     
-    // Request notification permission
-    requestNotificationPermission();
-
     // Load app state
     const loaded = loadAppState();
     setState(loaded);
@@ -138,6 +142,53 @@ export default function App() {
       setIsOnboarding(true);
     }
   }, []);
+
+  // Automated background timer to send pre-prayer review notification when time is reached
+  const notifiedPrayersRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!state || !state.profile) return;
+    const profile = state.profile;
+    if (profile.enableNotifications === false || profile.notifyPrayerReviewBefore === false) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      if (typeof window === "undefined" || !("Notification" in window) || Notification.permission !== "granted") {
+        return;
+      }
+
+      const tasks = getTasksForDate(state, todayStr);
+      const prayerList = calculateTodayPrayers(profile);
+      const slots = profile.appTrack === "review_only" 
+        ? distributeKhatmahReviewToPrayers(profile) 
+        : distributeReviewsToPrayers(tasks, profile);
+
+      const now = new Date();
+      prayerList.forEach((p) => {
+        const offset = getPrayerOffsetMinutes(profile, p.arabicName);
+        const reminderTime = new Date(p.time.getTime() - offset * 60 * 1000);
+        const notifKey = `${todayStr}_${p.arabicName}`;
+
+        const diffSeconds = (now.getTime() - reminderTime.getTime()) / 1000;
+        if (diffSeconds >= 0 && diffSeconds < 90 && !notifiedPrayersRef.current.has(notifKey)) {
+          notifiedPrayersRef.current.add(notifKey);
+
+          const matchedSlots = slots.filter(s => s.parentPrayer === p.arabicName);
+          const reviewsText = matchedSlots.length > 0 
+            ? matchedSlots.map(s => `${s.prayerName}: ${s.assignedContent}`).join(" | ")
+            : "لا يوجد ورد مراجعة مخصص لهذه الصلاة اليوم.";
+
+          new Notification(`⏰ تذكير بمراجعة صلاة ${p.arabicName} (بقي ${offset} دقيقة على الأذان)`, {
+            body: `وردك المخصص للركعات: ${reviewsText}`,
+            dir: "rtl"
+          });
+        }
+      });
+    }, 20000);
+
+    return () => clearInterval(interval);
+  }, [state, todayStr]);
 
   if (!state) {
     return (
@@ -166,7 +217,7 @@ export default function App() {
     const gender = (data.get("gender") as "male" | "female") || "male";
     const prayerRole = (data.get("prayerRole") as "imam" | "maamoom") || "imam";
     const useSunnah = data.get("useSunnah") === "on";
-    const nightPrayerRakats = Number(data.get("nightPrayerRakats")) || 8;
+    const nightPrayerRakats = data.get("nightPrayerRakats") !== null ? Number(data.get("nightPrayerRakats")) : 8;
     const direction = (data.get("direction") as "forward" | "backward") || "forward";
 
     const updatedProfile: UserProfile = {
@@ -204,9 +255,93 @@ export default function App() {
       memorizationDirection: "forward",
       autoOpenMushaf: true,
       streakDays: 3,
-      lastActiveDate: todayStr
+      lastActiveDate: todayStr,
+      enableNotifications: true,
+      notifyPrayerTimes: true,
+      notifyReviewReminder: true,
+      notifyPrayerReviewBefore: true,
+      prayerReminderOffsetMinutes: 15,
+      prayerReminderOffsets: {
+        fajr: 15,
+        dhuhr: 15,
+        asr: 15,
+        maghrib: 15,
+        isha: 15
+      },
+      duhaRakats: 4,
+      appTrack: "hifz_and_review",
+      reviewOnlyDirection: "forward",
+      reviewOnlyDailyAmountType: "juz",
+      reviewOnlyDailyAmountValue: 20,
+      reviewOnlyCurrentPage: 1,
+      reviewOnlyCompletedDates: []
     };
   }
+
+  // Request browser notification permission
+  const handleRequestNotifPermission = async () => {
+    if (!("Notification" in window)) {
+      alert("متصفحك الحالي لا يدعم ميزة إشعارات النظام.");
+      return;
+    }
+    try {
+      const perm = await Notification.requestPermission();
+      setNotifPermission(perm);
+      if (perm === "granted") {
+        new Notification("رفيق الحافظ 📖", {
+          body: "تم تفعيل الإشعارات بنجاح! سنقوم بتنبيهك بمواقيت الصلاة وجدول المراجعات اليومية.",
+          dir: "rtl"
+        });
+        if (state) {
+          const updated = { ...state, profile: { ...userProfile, enableNotifications: true } };
+          updateState(logActivity(updated, "تفعيل الإشعارات", "تم إعطاء إذن الإشعارات من المتصفح بنجاح."));
+        }
+      } else if (perm === "denied") {
+        alert("تم رفض إذن الإشعارات في المتصفح. يمكنك السماح بها بالضغط على أرقام/أيقونة الموقع في شريط العناوين بالمتصفح.");
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Test notification function
+  const handleTestNotification = () => {
+    if (!("Notification" in window)) {
+      alert("متصفحك لا يدعم الإشعارات.");
+      return;
+    }
+    if (Notification.permission === "granted") {
+      new Notification("رفيق الحافظ 📖 (إشعار تجريبي)", {
+        body: "الحمد لله! نظام التنبيهات يعمل بنجاح في تطبيق رفيق الحافظ.",
+        dir: "rtl"
+      });
+    } else {
+      handleRequestNotifPermission();
+    }
+  };
+
+  // Test prayer specific reminder notification
+  const handleTestPrayerReminderNotification = (prayerArabicName: string, slots: DistributedSlot[]) => {
+    if (!("Notification" in window)) {
+      alert("متصفحك لا يدعم الإشعارات.");
+      return;
+    }
+
+    const offset = getPrayerOffsetMinutes(userProfile, prayerArabicName);
+    const matchedSlots = slots.filter(s => s.parentPrayer === prayerArabicName);
+    const reviewsText = matchedSlots.length > 0 
+      ? matchedSlots.map(s => `${s.prayerName}: ${s.assignedContent}`).join(" | ")
+      : "لا يوجد ورد مراجعة مخصص لهذه الصلاة اليوم.";
+
+    if (Notification.permission === "granted") {
+      new Notification(`⏰ تذكير مراجعة صلاة ${prayerArabicName} (قبل الأذان بـ ${offset} دقيقة)`, {
+        body: `وردك المخصص لركعات صلاة ${prayerArabicName}: ${reviewsText}`,
+        dir: "rtl"
+      });
+    } else {
+      handleRequestNotifPermission();
+    }
+  };
 
   // Get active user profile
   const userProfile = profile || DEFAULT_PROFILE_FALLBACK();
@@ -286,26 +421,25 @@ export default function App() {
     if (!block) return;
     const sName = getSurahName(block.surahId);
 
-    if (confirm(`هل أنت متأكد من حذف هذا المقرر؟ سيؤدي ذلك لحذف تقدمه وجميع المراجعات المرتبطة به.`)) {
-      const filteredBlocks = state.blocks.filter(b => b.id !== blockId);
-      const cleanRepetitions = { ...state.repetitions };
-      delete cleanRepetitions[blockId];
+    const filteredBlocks = state.blocks.filter(b => b.id !== blockId);
+    const cleanRepetitions = { ...state.repetitions };
+    delete cleanRepetitions[blockId];
 
-      // Also clean completed reviews references for this block
-      const cleanCompleted: CompletedReviews = {};
-      Object.entries(state.completedReviews).forEach(([date, ids]) => {
-        cleanCompleted[date] = (ids as string[]).filter(id => id !== blockId);
-      });
+    // Also clean completed reviews references for this block
+    const cleanCompleted: CompletedReviews = {};
+    Object.entries(state.completedReviews).forEach(([date, ids]) => {
+      cleanCompleted[date] = (ids as string[]).filter(id => id !== blockId);
+    });
 
-      const updatedState = {
-        ...state,
-        blocks: filteredBlocks,
-        repetitions: cleanRepetitions,
-        completedReviews: cleanCompleted
-      };
+    const updatedState = {
+      ...state,
+      blocks: filteredBlocks,
+      repetitions: cleanRepetitions,
+      completedReviews: cleanCompleted
+    };
 
-      updateState(logActivity(updatedState, "حذف مقرر حفظ", `تم حذف مقرر سورة ${sName} (الآيات ${block.fromAyah} - ${block.toAyah})`));
-    }
+    updateState(logActivity(updatedState, "حذف مقرر حفظ", `تم حذف مقرر سورة ${sName} (الآيات ${block.fromAyah} - ${block.toAyah})`));
+    setDeletingBlockId(null);
   };
 
   // Complete a review task
@@ -410,6 +544,104 @@ export default function App() {
     }
   };
 
+  // Khatmah Review complete handler
+  const handleCompleteKhatmahReviewToday = () => {
+    const isSurahAyah = userProfile.reviewOnlyDailyAmountType === "surah_ayah";
+    const completedDates = userProfile.reviewOnlyCompletedDates || [];
+    const isAlreadyDone = completedDates.includes(todayStr);
+
+    let updatedProfile: UserProfile;
+
+    if (isSurahAyah) {
+      const sId = userProfile.reviewOnlySurahId || 2;
+      const fA = userProfile.reviewOnlyFromAyah || 1;
+      const tA = userProfile.reviewOnlyToAyah || 100;
+      const surahObj = getSurahById(sId);
+      const maxA = surahObj ? surahObj.ayahs : 286;
+      const span = Math.abs(tA - fA) + 1;
+
+      let nextSId = sId;
+      let nextFA = tA + 1;
+      let nextTA = nextFA + span - 1;
+
+      if (nextFA > maxA) {
+        nextSId = (sId % 114) + 1;
+        nextFA = 1;
+        const nextSurahObj = getSurahById(nextSId);
+        const nextMaxA = nextSurahObj ? nextSurahObj.ayahs : 100;
+        nextTA = Math.min(span, nextMaxA);
+      } else if (nextTA > maxA) {
+        nextTA = maxA;
+      }
+
+      const nextPage = getPageForAyah(nextSId, nextFA);
+
+      let updatedDates = completedDates;
+      if (!isAlreadyDone) {
+        updatedDates = [...completedDates, todayStr];
+      }
+
+      updatedProfile = {
+        ...userProfile,
+        reviewOnlySurahId: nextSId,
+        reviewOnlyFromAyah: nextFA,
+        reviewOnlyToAyah: nextTA,
+        reviewOnlyCurrentPage: nextPage,
+        reviewOnlyCompletedDates: updatedDates,
+        streakDays: userProfile.streakDays + (isAlreadyDone ? 0 : 1)
+      };
+
+      const surahName = getSurahById(nextSId)?.name || "";
+      const updatedState = { ...state, profile: updatedProfile };
+      updateState(logActivity(updatedState, "إنجاز ورد المراجعة اليومي", `تم إتمام ورد المراجعة بالسورة والآيات. الانتقال لموضع: سورة ${surahName} (آية ${nextFA}-${nextTA}).`));
+      alert(`هنيئاً لك! تم إتمام ورد المراجعة لهذا اليوم بنجاح وتقدم موضعك إلى سورة ${surahName} من الآية ${nextFA} إلى ${nextTA} 📖✨`);
+    } else {
+      const curPage = userProfile.reviewOnlyCurrentPage || 1;
+      const amount = userProfile.reviewOnlyDailyAmountValue || 20;
+      const dir = userProfile.reviewOnlyDirection || "forward";
+
+      let nextPage = curPage;
+      if (dir === "forward") {
+        nextPage = ((curPage - 1 + amount) % 604) + 1;
+      } else {
+        nextPage = ((curPage - 1 - amount + 604000) % 604) + 1;
+      }
+
+      let updatedDates = completedDates;
+      if (!isAlreadyDone) {
+        updatedDates = [...completedDates, todayStr];
+      }
+
+      updatedProfile = {
+        ...userProfile,
+        reviewOnlyCurrentPage: nextPage,
+        reviewOnlyCompletedDates: updatedDates,
+        streakDays: userProfile.streakDays + (isAlreadyDone ? 0 : 1)
+      };
+
+      const updatedState = { ...state, profile: updatedProfile };
+      const dirLabel = dir === "forward" ? "من البقرة إلى الناس" : "من الناس إلى البقرة";
+      updateState(logActivity(updatedState, "إنجاز ورد المراجعة اليومي", `تم بحمد الله إتمام ورد المراجعة لليوم (${amount} صفحة - اتجاه ${dirLabel}). الانتقال للصحيفة ${nextPage}.`));
+      alert(`هنيئاً لك! تم إتمام ورد المراجعة لهذا اليوم بنجاح وتقدم موضعك إلى الصحيفة رقم ${nextPage} 📖✨`);
+    }
+
+    // Tone feedback
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
+      osc.frequency.setValueAtTime(659.25, audioCtx.currentTime + 0.15); // E5
+      gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+      osc.start();
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.4);
+      osc.stop(audioCtx.currentTime + 0.4);
+    } catch (e) {}
+  };
+
   // Open Mushaf at exact page representing a Surah/Ayah
   const navigateToMushaf = (surahId: number, ayahNum: number) => {
     const targetPage = getPageForAyah(surahId, ayahNum);
@@ -423,11 +655,70 @@ export default function App() {
   // Calculate prayer times
   const prayerTimesList = calculateTodayPrayers(userProfile);
   
-  // Distribute reviews dynamically across prayers
-  const distributionSlots = distributeReviewsToPrayers(todayTasks, userProfile);
+  // Distribute reviews dynamically across prayers based on active track
+  const distributionSlots = userProfile.appTrack === "review_only"
+    ? distributeKhatmahReviewToPrayers(userProfile)
+    : distributeReviewsToPrayers(todayTasks, userProfile);
 
   // Group blocks for cumulative reviews
   const cumulativeGroups = getCumulativeGroups(state.blocks);
+
+  // Main Review Assignment computations
+  const mainStartSurahId = userProfile.mainReviewStartSurahId || 114;
+  const mainEndSurahId = userProfile.mainReviewEndSurahId || 18;
+  const mainStartPage = getPageForAyah(mainStartSurahId, 1);
+  const mainEndPage = getPageForAyah(mainEndSurahId, 1);
+  const totalPagesInMainAssignment = Math.max(1, Math.abs(mainStartPage - mainEndPage) + 1);
+
+  const reviewedPagesSoFar = userProfile.mainReviewProgressPages || 0;
+  const mainDailyPortion = userProfile.reviewOnlyDailyAmountValue || 10;
+
+  const mainProgressPercentage = Math.min(100, Math.max(0, Math.round((reviewedPagesSoFar / totalPagesInMainAssignment) * 1000) / 10));
+  const remainingMainPages = Math.max(0, totalPagesInMainAssignment - reviewedPagesSoFar);
+  const estimatedDaysRemaining = Math.ceil(remainingMainPages / Math.max(1, mainDailyPortion));
+
+  const handleRecordMainReviewDailyPortion = () => {
+    const newProgressPages = Math.min(totalPagesInMainAssignment, reviewedPagesSoFar + mainDailyPortion);
+    const updated = {
+      ...state,
+      profile: {
+        ...userProfile,
+        mainReviewProgressPages: newProgressPages,
+        streakDays: userProfile.streakDays + 1
+      }
+    };
+    updateState(logActivity(updated, "إنجاز ورد المراجعة الرئيسي", `تم إنجاز ${mainDailyPortion} صفحة من مقرر المراجعة الرئيسي. نسبة الإنجاز الحالية: ${Math.round((newProgressPages / totalPagesInMainAssignment) * 100)}%`));
+
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(523.25, audioCtx.currentTime);
+      osc.frequency.setValueAtTime(659.25, audioCtx.currentTime + 0.12);
+      gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      osc.start();
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.35);
+      osc.stop(audioCtx.currentTime + 0.35);
+    } catch (e) {}
+
+    alert(`تبارك الله! تم إنجاز ورد اليوم لـ مقرر المراجعة الرئيسي (+${mainDailyPortion} صفحة). نسبة إنجازك الكلية أصبحت ${Math.round((newProgressPages / totalPagesInMainAssignment) * 100)}% 📖✨`);
+  };
+
+  const handleResetMainReviewProgress = () => {
+    if (confirm("هل تريد إعادة ضبط حسبة تقدم مقرر المراجعة الرئيسي إلى 0 صفحة؟")) {
+      const updated = {
+        ...state,
+        profile: {
+          ...userProfile,
+          mainReviewProgressPages: 0
+        }
+      };
+      updateState(updated);
+    }
+  };
 
   // Export JSON backup
   const handleExportBackup = () => {
@@ -621,6 +912,36 @@ export default function App() {
           </div>
         )}
 
+        {/* TRACK BANNER */}
+        <div className="bg-gradient-to-r from-emerald-900 via-teal-900 to-emerald-950 text-white rounded-3xl p-4 md:p-5 shadow-lg flex flex-col md:flex-row items-center justify-between gap-4 border border-emerald-700/50">
+          <div className="flex items-center space-x-3 space-x-reverse">
+            <div className="w-12 h-12 bg-amber-400/20 border-2 border-amber-400/40 rounded-2xl flex items-center justify-center shrink-0 shadow-inner">
+              <Compass className="w-6 h-6 text-amber-300" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-amber-300">مسار النظام النشط:</span>
+                <span className="text-xs font-bold bg-white/10 px-3 py-0.5 rounded-full border border-white/20">
+                  {userProfile.appTrack === "review_only" ? "🔵 مسار المراجعة فقط" : "🟢 مسار الحفظ والمراجعة"}
+                </span>
+              </div>
+              <p className="text-xs text-emerald-200 mt-1">
+                {userProfile.appTrack === "review_only"
+                  ? "مخصص للحُفّاظ لمراجعة القرآن كاملاً بتسلسل محدد أو بالسورة والآيات وتوزيعه على الصلوات والسنن"
+                  : "مخصص للطلاب للحفظ الجديد مع عداد مائة التكرار والمراجعات التراكمية المتباعدة"}
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => setActiveTab("settings")}
+            className="px-4 py-2.5 bg-white/10 hover:bg-white/20 text-amber-300 hover:text-amber-200 font-bold text-xs rounded-2xl border border-white/20 transition flex items-center justify-center gap-2 shrink-0 self-stretch md:self-auto"
+          >
+            <Settings className="w-4 h-4 text-amber-300" />
+            <span>تغيير المسار من الإعدادات</span>
+          </button>
+        </div>
+
         {/* TABS CONTAINER */}
         <AnimatePresence mode="wait">
           
@@ -633,7 +954,432 @@ export default function App() {
               exit={{ opacity: 0, y: -10 }}
               className="space-y-6"
             >
-              {/* Daily status box and geolocation state */}
+              {userProfile.appTrack === "review_only" ? (
+                /* TRACK 2: REVIEW ONLY HOME VIEW */
+                <div className="space-y-6">
+                  {/* Track 2 Review Controller Card */}
+                  <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-6">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-gray-100 pb-4">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="px-2.5 py-0.5 bg-blue-100 text-blue-900 font-bold text-xs rounded-full">مسار المراجعة فقط</span>
+                          <span className="text-xs text-gray-500">ختمة المراجعة الشاملة المتسلسلة</span>
+                        </div>
+                        <h3 className="text-xl font-serif font-bold text-gray-800 mt-2">
+                          {userProfile.reviewOnlyDailyAmountType === "surah_ayah" 
+                            ? `مقرر مراجعة اليوم: سورة ${getSurahById(userProfile.reviewOnlySurahId || 2)?.name || "البقرة"} (آية ${userProfile.reviewOnlyFromAyah || 1} إلى ${userProfile.reviewOnlyToAyah || 100})`
+                            : `مقرر مراجعة اليوم: الصحيفة ${userProfile.reviewOnlyCurrentPage || 1} من 604`}
+                        </h3>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {userProfile.reviewOnlyDailyAmountType === "surah_ayah"
+                            ? `من الصحيفة ${getPageForAyah(userProfile.reviewOnlySurahId || 2, userProfile.reviewOnlyFromAyah || 1)} إلى ${getPageForAyah(userProfile.reviewOnlySurahId || 2, userProfile.reviewOnlyToAyah || 100)}`
+                            : `السورة الحالية: سورة ${getSurahForPage(userProfile.reviewOnlyCurrentPage || 1)} • اتجاه المراجعة: ${userProfile.reviewOnlyDirection === "forward" ? "من البقرة إلى الناس (تصاعدي)" : "من الناس إلى البقرة (تنازلي)"}`}
+                        </p>
+                      </div>
+
+                      <button 
+                        onClick={() => {
+                          const p = userProfile.reviewOnlyDailyAmountType === "surah_ayah"
+                            ? getPageForAyah(userProfile.reviewOnlySurahId || 2, userProfile.reviewOnlyFromAyah || 1)
+                            : (userProfile.reviewOnlyCurrentPage || 1);
+                          setMushafPage(p);
+                          setActiveTab("mushaf");
+                        }}
+                        className="px-4 py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-bold text-xs rounded-xl flex items-center justify-center gap-2 transition border border-emerald-200/60"
+                      >
+                        <BookOpen className="w-4 h-4 text-emerald-700" />
+                        <span>فتح المصحف الشريف عند الموضع</span>
+                      </button>
+                    </div>
+
+                    {/* Review Options Form */}
+                    <div className="space-y-4 bg-gray-50/80 p-4 rounded-2xl border border-gray-200/60">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        
+                        {/* 1. Review Direction */}
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-gray-700 block">1. اتجاه المراجعة المتسلسلة</label>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <button
+                              onClick={() => {
+                                const updated = { ...state, profile: { ...userProfile, reviewOnlyDirection: "forward" as const } };
+                                updateState(updated);
+                              }}
+                              className={`py-2 px-2 text-xs font-bold rounded-xl border transition ${
+                                (userProfile.reviewOnlyDirection || "forward") === "forward"
+                                  ? "bg-emerald-700 text-white border-emerald-800 shadow-sm"
+                                  : "bg-white text-gray-700 border-gray-200 hover:bg-gray-100"
+                              }`}
+                            >
+                              من البقرة إلى الناس
+                            </button>
+                            <button
+                              onClick={() => {
+                                const updated = { ...state, profile: { ...userProfile, reviewOnlyDirection: "backward" as const } };
+                                updateState(updated);
+                              }}
+                              className={`py-2 px-2 text-xs font-bold rounded-xl border transition ${
+                                userProfile.reviewOnlyDirection === "backward"
+                                  ? "bg-emerald-700 text-white border-emerald-800 shadow-sm"
+                                  : "bg-white text-gray-700 border-gray-200 hover:bg-gray-100"
+                              }`}
+                            >
+                              من الناس إلى البقرة
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* 2. Daily Review Amount */}
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-gray-700 block">2. مقدار المراجعة هذا اليوم</label>
+                          <select
+                            value={userProfile.reviewOnlyDailyAmountType === "surah_ayah" ? "surah_ayah" : (userProfile.reviewOnlyDailyAmountValue || 20)}
+                            onChange={(e) => {
+                              const valStr = e.target.value;
+                              if (valStr === "surah_ayah") {
+                                const sId = userProfile.reviewOnlySurahId || 2;
+                                const fAyah = userProfile.reviewOnlyFromAyah || 1;
+                                const tAyah = userProfile.reviewOnlyToAyah || 100;
+                                const startP = getPageForAyah(sId, fAyah);
+                                const endP = getPageForAyah(sId, tAyah);
+                                const amtP = Math.abs(endP - startP) + 1;
+                                const updated = {
+                                  ...state,
+                                  profile: {
+                                    ...userProfile,
+                                    reviewOnlyDailyAmountType: "surah_ayah" as const,
+                                    reviewOnlyDailyAmountValue: amtP
+                                  }
+                                };
+                                updateState(updated);
+                              } else {
+                                const val = Number(valStr);
+                                let type: "pages" | "hizb" | "juz" = "pages";
+                                if (val === 10) type = "hizb";
+                                if (val === 20 || val === 40) type = "juz";
+                                const updated = {
+                                  ...state,
+                                  profile: {
+                                    ...userProfile,
+                                    reviewOnlyDailyAmountValue: val,
+                                    reviewOnlyDailyAmountType: type
+                                  }
+                                };
+                                updateState(updated);
+                              }
+                            }}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-white text-xs font-bold text-gray-800"
+                          >
+                            <option value="1">1 صفحة واحدة في اليوم</option>
+                            <option value="2">صفحتان (وجهان في اليوم)</option>
+                            <option value="5">5 صفحات في اليوم</option>
+                            <option value="10">حزب واحد (~10 صفحات)</option>
+                            <option value="20">جزء واحد كامل (20 صفحة)</option>
+                            <option value="40">جزآن (40 صفحة)</option>
+                            <option value="60">3 أجزاء (60 صفحة)</option>
+                            <option value="surah_ayah">📖 مخصص بناءً على اسم السورة والآيات</option>
+                          </select>
+                        </div>
+
+                        {/* 3. Set Current Page position */}
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-gray-700 block">3. موضع الصحيفة الحالية في الختمة</label>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="number"
+                              min="1"
+                              max="604"
+                              value={userProfile.reviewOnlyCurrentPage || 1}
+                              onChange={(e) => {
+                                const p = Math.max(1, Math.min(604, Number(e.target.value) || 1));
+                                const updated = { ...state, profile: { ...userProfile, reviewOnlyCurrentPage: p } };
+                                updateState(updated);
+                              }}
+                              className="w-full px-3 py-1.5 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-white text-xs font-bold font-mono text-center"
+                            />
+                            <span className="text-xs font-bold text-gray-500 whitespace-nowrap">من 604</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* SURAH & AYAH CONTROLS IF SELECTED */}
+                      {userProfile.reviewOnlyDailyAmountType === "surah_ayah" && (
+                        <div className="bg-emerald-50/90 p-4 rounded-2xl border border-emerald-200/80 space-y-3 mt-2">
+                          <div className="text-xs font-bold text-emerald-950 flex items-center gap-2">
+                            <BookOpen className="w-4 h-4 text-emerald-700" />
+                            <span>تخصيص ورد المراجعة اليومية بناءً على اسم السورة ونطاق الآيات:</span>
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            {/* Surah select */}
+                            <div className="space-y-1">
+                              <label className="text-[11px] font-bold text-gray-700 block">اسم السورة</label>
+                              <select
+                                value={userProfile.reviewOnlySurahId || 2}
+                                onChange={(e) => {
+                                  const sId = Number(e.target.value);
+                                  const surahObj = getSurahById(sId);
+                                  const maxA = surahObj ? surahObj.ayahs : 286;
+                                  const fAyah = 1;
+                                  const tAyah = Math.min(100, maxA);
+                                  const startP = getPageForAyah(sId, fAyah);
+                                  const endP = getPageForAyah(sId, tAyah);
+                                  const amtP = Math.abs(endP - startP) + 1;
+
+                                  const updated = {
+                                    ...state,
+                                    profile: {
+                                      ...userProfile,
+                                      reviewOnlySurahId: sId,
+                                      reviewOnlyFromAyah: fAyah,
+                                      reviewOnlyToAyah: tAyah,
+                                      reviewOnlyCurrentPage: startP,
+                                      reviewOnlyDailyAmountValue: amtP,
+                                      reviewOnlyDailyAmountType: "surah_ayah" as const
+                                    }
+                                  };
+                                  updateState(updated);
+                                }}
+                                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-xl bg-white text-xs font-bold text-gray-800"
+                              >
+                                {SURAHS.map((s) => (
+                                  <option key={s.id} value={s.id}>
+                                    {s.id}. سورة {s.name} ({s.ayahs} آية)
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            {/* From Ayah */}
+                            <div className="space-y-1">
+                              <label className="text-[11px] font-bold text-gray-700 block">من الآية رقم</label>
+                              <input
+                                type="number"
+                                min="1"
+                                max={getSurahById(userProfile.reviewOnlySurahId || 2)?.ayahs || 286}
+                                value={userProfile.reviewOnlyFromAyah || 1}
+                                onChange={(e) => {
+                                  const fAyah = Math.max(1, Number(e.target.value) || 1);
+                                  const sId = userProfile.reviewOnlySurahId || 2;
+                                  const tAyah = userProfile.reviewOnlyToAyah || 100;
+                                  const startP = getPageForAyah(sId, fAyah);
+                                  const endP = getPageForAyah(sId, tAyah);
+                                  const amtP = Math.abs(endP - startP) + 1;
+
+                                  const updated = {
+                                    ...state,
+                                    profile: {
+                                      ...userProfile,
+                                      reviewOnlyFromAyah: fAyah,
+                                      reviewOnlyCurrentPage: startP,
+                                      reviewOnlyDailyAmountValue: amtP
+                                    }
+                                  };
+                                  updateState(updated);
+                                }}
+                                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-xl bg-white text-xs font-bold text-center font-mono"
+                              />
+                            </div>
+
+                            {/* To Ayah */}
+                            <div className="space-y-1">
+                              <label className="text-[11px] font-bold text-gray-700 block">إلى الآية رقم</label>
+                              <input
+                                type="number"
+                                min="1"
+                                max={getSurahById(userProfile.reviewOnlySurahId || 2)?.ayahs || 286}
+                                value={userProfile.reviewOnlyToAyah || 100}
+                                onChange={(e) => {
+                                  const tAyah = Math.max(1, Number(e.target.value) || 1);
+                                  const sId = userProfile.reviewOnlySurahId || 2;
+                                  const fAyah = userProfile.reviewOnlyFromAyah || 1;
+                                  const startP = getPageForAyah(sId, fAyah);
+                                  const endP = getPageForAyah(sId, tAyah);
+                                  const amtP = Math.abs(endP - startP) + 1;
+
+                                  const updated = {
+                                    ...state,
+                                    profile: {
+                                      ...userProfile,
+                                      reviewOnlyToAyah: tAyah,
+                                      reviewOnlyDailyAmountValue: amtP
+                                    }
+                                  };
+                                  updateState(updated);
+                                }}
+                                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-xl bg-white text-xs font-bold text-center font-mono"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Today's portion banner */}
+                    {(() => {
+                      const isSurahAyah = userProfile.reviewOnlyDailyAmountType === "surah_ayah";
+                      let curP = userProfile.reviewOnlyCurrentPage || 1;
+                      let endP = curP;
+                      let bannerTitle = "";
+                      let bannerSubtitle = "";
+                      let amtLabel = "";
+
+                      if (isSurahAyah) {
+                        const sId = userProfile.reviewOnlySurahId || 2;
+                        const fA = userProfile.reviewOnlyFromAyah || 1;
+                        const tA = userProfile.reviewOnlyToAyah || 100;
+                        const surahObj = getSurahById(sId);
+                        const surahName = surahObj ? surahObj.name : "البقرة";
+                        const startP = getPageForAyah(sId, fA);
+                        const endPVal = getPageForAyah(sId, tA);
+                        curP = Math.min(startP, endPVal);
+                        endP = Math.max(startP, endPVal);
+                        const pageSpan = Math.abs(endPVal - startP) + 1;
+
+                        bannerTitle = `سورة ${surahName} (الآيات من ${fA} إلى ${tA})`;
+                        bannerSubtitle = `تغطي الصحائف من ${curP} إلى ${endP} (${pageSpan} صفحة)`;
+                        amtLabel = `ورد مخصص بالسور والآيات`;
+                      } else {
+                        const amt = userProfile.reviewOnlyDailyAmountValue || 20;
+                        const dir = userProfile.reviewOnlyDirection || "forward";
+                        
+                        if (dir === "forward") {
+                          endP = curP + amt - 1;
+                          if (endP > 604) endP = ((endP - 1) % 604) + 1;
+                        } else {
+                          endP = curP - amt + 1;
+                          if (endP < 1) endP = 604 + (endP % 604);
+                        }
+
+                        bannerTitle = `الصحائف من ${curP} إلى ${endP}`;
+                        bannerSubtitle = `تغطية سورة ${getSurahForPage(curP)} ➔ سورة ${getSurahForPage(endP)}`;
+                        amtLabel = `${amt} صفحة`;
+                      }
+
+                      const isCompletedToday = (userProfile.reviewOnlyCompletedDates || []).includes(todayStr);
+
+                      return (
+                        <div className="bg-emerald-50/70 p-5 rounded-2xl border border-emerald-200 space-y-3">
+                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                            <div>
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 bg-emerald-200/80 px-2.5 py-0.5 rounded-md">
+                                ورد اليوم المعتمد ({amtLabel})
+                              </span>
+                              <h4 className="text-lg font-bold text-emerald-950 mt-1">
+                                {bannerTitle}
+                              </h4>
+                              <p className="text-xs text-emerald-800 mt-0.5">
+                                {bannerSubtitle}
+                              </p>
+                            </div>
+
+                            <button
+                              onClick={handleCompleteKhatmahReviewToday}
+                              className={`px-5 py-3 rounded-2xl font-bold text-xs shadow-md transition-all flex items-center justify-center gap-2 ${
+                                isCompletedToday
+                                  ? "bg-emerald-200 text-emerald-900 border border-emerald-300 hover:bg-emerald-300"
+                                  : "bg-gradient-to-r from-emerald-700 to-emerald-900 text-white hover:from-emerald-800 hover:to-emerald-950 hover:shadow-lg"
+                              }`}
+                            >
+                              <CheckCircle className="w-5 h-5 text-emerald-300" />
+                              <span>{isCompletedToday ? "تم إتمام ورد اليوم (انقر للانتقال للورد القادم)" : "إتمام ورد المراجعة لهذا اليوم 🌟"}</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Prayer Distribution & Prayer Times Grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    {/* Prayer Distribution for Today's Review Portion */}
+                    <div className="md:col-span-2 bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
+                      <h3 className="text-lg font-serif font-bold text-emerald-900 border-b border-gray-100 pb-3 flex items-center justify-between">
+                        <span>🕌 تقسيم مقرر المراجعة على الصلوات والسنن</span>
+                        <span className="text-xs font-sans text-gray-500 bg-emerald-50 px-2 py-0.5 rounded-md">موزع آلياً على الركعات</span>
+                      </h3>
+
+                      <div className="space-y-2.5 max-h-[420px] overflow-y-auto pr-1">
+                        {distributionSlots.length === 0 ? (
+                          <p className="text-xs text-gray-500 text-center py-6">جاري توزيع ورد المراجعة على الصلوات...</p>
+                        ) : (
+                          distributionSlots.map((slot, idx) => (
+                            <div key={slot.id || idx} className="p-3 bg-gray-50/80 hover:bg-gray-50 rounded-2xl border border-gray-200/70 flex items-center justify-between gap-3 text-xs transition">
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <span className="font-bold text-gray-800">{slot.prayerName}</span>
+                                  <span className={`px-2 py-0.5 text-[9px] font-bold rounded-full ${
+                                    slot.prayerType === "fard" ? "bg-amber-100 text-amber-900" : "bg-emerald-100 text-emerald-900"
+                                  }`}>
+                                    {slot.prayerType === "fard" ? "فرض" : slot.prayerType === "sunnah" ? "سنة" : "قيام"}
+                                  </span>
+                                </div>
+                                <p className="text-emerald-800 font-semibold mt-1">{slot.assignedContent}</p>
+                              </div>
+
+                              <button
+                                onClick={() => {
+                                  const match = slot.assignedContent.match(/\d+/);
+                                  if (match) {
+                                    setMushafPage(Number(match[0]));
+                                    setActiveTab("mushaf");
+                                  }
+                                }}
+                                className="px-2.5 py-1 bg-white hover:bg-emerald-50 border border-gray-200 text-emerald-800 rounded-xl text-[10px] font-bold shrink-0 transition"
+                              >
+                                قراءة بالمصحف 📖
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    {/* GPS Prayer Widget */}
+                    <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 flex flex-col justify-between space-y-4">
+                      <div>
+                        <h3 className="text-lg font-serif font-bold text-emerald-900 border-b border-gray-100 pb-3 flex items-center justify-between">
+                          <span>🕌 مواقيت الصلاة للأذان</span>
+                          <button 
+                            onClick={handleDetectLocation}
+                            disabled={gpsLoading}
+                            className="p-1 px-3 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 rounded-xl text-xs flex items-center gap-1 transition"
+                          >
+                            <Compass className={`w-3.5 h-3.5 ${gpsLoading ? "animate-spin" : ""}`} />
+                            <span>رصد GPS</span>
+                          </button>
+                        </h3>
+
+                        <div className="mt-3 flex items-center gap-1.5 text-xs text-gray-500 bg-gray-50 p-2 rounded-xl border border-gray-100">
+                          <MapPin className="w-3.5 h-3.5 text-emerald-600" />
+                          <span>الموقع:</span>
+                          <span className="font-mono bg-white px-1.5 py-0.5 rounded border text-[10px]">
+                            {userProfile.lat.toFixed(3)}°N, {userProfile.lng.toFixed(3)}°E
+                          </span>
+                        </div>
+
+                        <div className="space-y-2 mt-4">
+                          {prayerTimesList.map((p) => (
+                            <div key={p.name} className="flex items-center justify-between text-xs p-1.5 px-2.5 rounded-xl bg-gray-50/50 hover:bg-gray-50 border border-transparent hover:border-gray-100 transition">
+                              <span className="font-semibold text-gray-700">{p.arabicName}</span>
+                              <span className="font-mono text-gray-600">
+                                {p.time.toLocaleTimeString("ar-SA", { hour: "2-digit", minute: "2-digit" })}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <p className="text-[9px] text-gray-400 bg-emerald-50/30 p-2 rounded-xl text-center">
+                        * يتم جلب مواقيت الصلاة بدقة بناءً على إحداثيات موقعك وفق مرجع أم القرى.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* TRACK 1: ORIGINAL HIFZ & REVIEW HOME VIEW */
+                <div className="space-y-6">
+                  {/* Daily status box and geolocation state */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 
                 {/* Repetitions counter box */}
@@ -842,8 +1588,10 @@ export default function App() {
                   </div>
                 )}
               </div>
-            </motion.div>
+            </div>
           )}
+          </motion.div>
+        )}
 
           {/* TAB 2: HIFZ / MEMORIZATION TARGETS */}
           {activeTab === "hifz" && (
@@ -989,13 +1737,31 @@ export default function App() {
                                 {isArchived ? "تنشيط المقرر" : "إتمام المقرر"}
                               </button>
 
-                              <button 
-                                onClick={() => handleDeleteBlock(block.id)}
-                                className="p-2 text-red-500 hover:bg-red-50 rounded-xl transition"
-                                title="حذف"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
+                              {deletingBlockId === block.id ? (
+                                <div className="flex items-center gap-1.5 bg-red-50 p-1.5 rounded-xl border border-red-200 animate-fade-in">
+                                  <span className="text-[11px] font-bold text-red-800">تأكيد الحذف؟</span>
+                                  <button 
+                                    onClick={() => handleDeleteBlock(block.id)}
+                                    className="px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer"
+                                  >
+                                    حذف
+                                  </button>
+                                  <button 
+                                    onClick={() => setDeletingBlockId(null)}
+                                    className="px-2 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg text-xs font-bold transition cursor-pointer"
+                                  >
+                                    إلغاء
+                                  </button>
+                                </div>
+                              ) : (
+                                <button 
+                                  onClick={() => setDeletingBlockId(block.id)}
+                                  className="p-2 text-red-500 hover:bg-red-50 hover:text-red-700 rounded-xl transition cursor-pointer"
+                                  title="حذف المقرر"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              )}
                             </div>
                           </div>
                         );
@@ -1018,112 +1784,338 @@ export default function App() {
             >
               {/* Top intro */}
               <div className="bg-emerald-800 text-white rounded-3xl p-6 shadow-sm space-y-2">
-                <h3 className="text-xl font-serif font-bold">🔁 هيكل المراجعة الذكية بالتكرار المتباعد</h3>
+                <h3 className="text-xl font-serif font-bold">🔁 خطة المراجعة اليومية ومتابعة مقرر المراجعة الرئيسي</h3>
                 <p className="text-xs text-emerald-100 leading-relaxed">
-                  يقوم رفيق الحافظ بجدولة مراجعتك تلقائياً لمدى الحفظ لـ 66 يوماً (المرحلة المكثفة أول 10 أيام متصلة، تليها مراجعة متباعدة دورية لتثبيت الذاكرة). في اليوم 66 يتم توجيه الحفظ لقسم مجمع (كل 15 مقرراً كحلقة واحدة) ليتم تدويره و مراجعته تجميعياً.
+                  يقوم رفيق الحافظ بجدولة مراجعتك اليومية بدقة، وحساب نسبة الإنجاز المئوية المنجزة من مقرر المراجعة الرئيسي المستهدف (مثل من سورة الناس إلى سورة الكهف) بناءً على وردك اليومي المخصص.
                 </p>
               </div>
 
-              {/* Sub categories grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                
-                {/* 1. Intensive scheduled reviews list */}
-                <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
-                  <h4 className="text-lg font-serif font-bold text-emerald-900 border-b border-gray-100 pb-2 flex items-center justify-between">
-                    <span>🔥 مراجعة مكثفة مستحقة (الأيام 2 - 10)</span>
-                    <span className="text-[10px] px-2 py-0.5 bg-amber-100 text-amber-800 rounded font-sans font-bold">يومي متتالي</span>
-                  </h4>
+              {/* MAIN REVIEW ASSIGNMENT & PROGRESS PERCENTAGE CARD */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-6">
+                {/* Card Header */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-gray-100 pb-4">
+                  <div className="space-y-1">
+                    <h3 className="text-xl font-serif font-bold text-emerald-900 flex items-center gap-2">
+                      <span>📊 نسبة ما تم مراجعته من مقرر المراجعة الرئيسي</span>
+                    </h3>
+                    <p className="text-xs text-gray-500 leading-relaxed">
+                      حدد نطاق مقرر المراجعة الرئيسي (مثال: من سورة الناس إلى سورة الكهف) وقسّمه لمقدار يومي لمتابعة نسبة الإنجاز يومياً.
+                    </p>
+                  </div>
 
-                  {todayTasks.filter(t => t.type === "review" && t.offset <= 10).length === 0 ? (
-                    <p className="text-xs text-gray-500 text-center py-8">لا يوجد مراجعات مكثفة مستحقة اليوم.</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {todayTasks.filter(t => t.type === "review" && t.offset <= 10).map(t => (
-                        <div key={t.block.id} className="flex items-center justify-between p-2.5 bg-gray-50 rounded-xl text-xs">
-                          <div>
-                            <span className="font-bold text-gray-800">سورة {getSurahName(t.block.surahId)}</span>
-                            <span className="text-gray-400 font-mono block">من آية {t.block.fromAyah} إلى {t.block.toAyah} (يوم {t.offset})</span>
-                          </div>
-                          <button 
-                            onClick={() => handleToggleReviewComplete(t.block.id)}
-                            className={`px-3 py-1 font-bold rounded-lg border ${
-                              t.isCompleted ? "bg-emerald-600 text-white border-emerald-700" : "bg-white hover:bg-emerald-50 text-gray-700 border-gray-300"
-                            }`}
-                          >
-                            {t.isCompleted ? "✓ تمت" : "تعيين مراجعة"}
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  <div className="bg-emerald-50 px-4 py-2.5 rounded-2xl border border-emerald-200/80 flex items-center gap-2 self-start md:self-auto shrink-0 shadow-2xs">
+                    <span className="text-xs font-bold text-emerald-800">نسبة الإنجاز الكلية:</span>
+                    <span className="text-2xl font-bold font-mono text-emerald-700">{mainProgressPercentage}%</span>
+                  </div>
                 </div>
 
-                {/* 2. Spaced scheduled reviews list */}
-                <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
-                  <h4 className="text-lg font-serif font-bold text-emerald-900 border-b border-gray-100 pb-2 flex items-center justify-between">
-                    <span>🌌 مراجعة متباعدة مستحقة (الأيام 12 - 66)</span>
-                    <span className="text-[10px] px-2 py-0.5 bg-blue-100 text-blue-800 rounded font-sans font-bold font-normal">تباعد منتظم</span>
-                  </h4>
-
-                  {todayTasks.filter(t => t.type === "review" && t.offset > 10).length === 0 ? (
-                    <p className="text-xs text-gray-500 text-center py-8">لا توجد مراجعات متباعدة مستحقة اليوم.</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {todayTasks.filter(t => t.type === "review" && t.offset > 10).map(t => (
-                        <div key={t.block.id} className="flex items-center justify-between p-2.5 bg-gray-50 rounded-xl text-xs">
-                          <div>
-                            <span className="font-bold text-gray-800">سورة {getSurahName(t.block.surahId)}</span>
-                            <span className="text-gray-400 font-mono block">الآيات {t.block.fromAyah} - {t.block.toAyah} (يوم {t.offset})</span>
-                          </div>
-                          <button 
-                            onClick={() => handleToggleReviewComplete(t.block.id)}
-                            className={`px-3 py-1 font-bold rounded-lg border ${
-                              t.isCompleted ? "bg-emerald-600 text-white border-emerald-700" : "bg-white hover:bg-emerald-50 text-gray-700 border-gray-300"
-                            }`}
-                          >
-                            {t.isCompleted ? "✓ تمت" : "تعيين مراجعة"}
-                          </button>
-                        </div>
+                {/* Scope & Daily Portion Selection Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-gray-50/70 p-4 rounded-2xl border border-gray-100">
+                  {/* Start Surah */}
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-gray-700 block">بداية المقرر الرئيسي (من سورة)</label>
+                    <select
+                      value={mainStartSurahId}
+                      onChange={(e) => {
+                        const sId = Number(e.target.value);
+                        const updated = {
+                          ...state,
+                          profile: {
+                            ...userProfile,
+                            mainReviewStartSurahId: sId
+                          }
+                        };
+                        updateState(updated);
+                      }}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-xl bg-white text-xs font-bold text-gray-800 focus:ring-2 focus:ring-emerald-600 focus:outline-none"
+                    >
+                      {SURAHS.map((s) => (
+                        <option key={`start-${s.id}`} value={s.id}>
+                          {s.id}. سورة {s.name} ({s.ayahs} آية)
+                        </option>
                       ))}
+                    </select>
+                  </div>
+
+                  {/* End Surah */}
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-gray-700 block">نهاية المقرر الرئيسي (إلى سورة)</label>
+                    <select
+                      value={mainEndSurahId}
+                      onChange={(e) => {
+                        const sId = Number(e.target.value);
+                        const updated = {
+                          ...state,
+                          profile: {
+                            ...userProfile,
+                            mainReviewEndSurahId: sId
+                          }
+                        };
+                        updateState(updated);
+                      }}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-xl bg-white text-xs font-bold text-gray-800 focus:ring-2 focus:ring-emerald-600 focus:outline-none"
+                    >
+                      {SURAHS.map((s) => (
+                        <option key={`end-${s.id}`} value={s.id}>
+                          {s.id}. سورة {s.name} ({s.ayahs} آية)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Daily Amount */}
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-gray-700 block">المقدار اليومي المخصص (صفحات/يوم)</label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="604"
+                      value={mainDailyPortion}
+                      onChange={(e) => {
+                        const val = Math.max(1, Number(e.target.value) || 1);
+                        const updated = {
+                          ...state,
+                          profile: {
+                            ...userProfile,
+                            reviewOnlyDailyAmountValue: val
+                          }
+                        };
+                        updateState(updated);
+                      }}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-xl bg-white text-xs font-bold text-center font-mono focus:ring-2 focus:ring-emerald-600 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                {/* Progress Visualizer & Interactive Metrics */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  {/* Visualizer & Details */}
+                  <div className="md:col-span-3 bg-gradient-to-br from-emerald-900 to-emerald-950 text-white p-5 rounded-2xl shadow-md space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-emerald-800/80 pb-3">
+                      <div>
+                        <span className="text-[10px] text-emerald-300 font-bold uppercase tracking-wider block">نطاق المقرر الرئيسي المحدد</span>
+                        <h4 className="text-lg font-serif font-bold text-white">
+                          من سورة {getSurahName(mainStartSurahId)} إلى سورة {getSurahName(mainEndSurahId)}
+                        </h4>
+                      </div>
+                      <div className="text-xs text-emerald-200 font-mono bg-emerald-800/60 px-3 py-1 rounded-xl border border-emerald-700/50">
+                        الصفحات: من ص {mainStartPage} إلى ص {mainEndPage} ({totalPagesInMainAssignment} صفحة)
+                      </div>
                     </div>
-                  )}
+
+                    {/* Progress Bar */}
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-xs font-bold text-emerald-200">
+                        <span>تم مراجعته: {reviewedPagesSoFar} من أصل {totalPagesInMainAssignment} صفحة</span>
+                        <span className="font-mono text-emerald-300">{mainProgressPercentage}%</span>
+                      </div>
+                      <div className="w-full bg-emerald-950/80 rounded-full h-4 p-0.5 border border-emerald-700/50 overflow-hidden">
+                        <div 
+                          className="bg-gradient-to-r from-emerald-400 to-teal-300 h-full rounded-full transition-all duration-500 shadow-sm"
+                          style={{ width: `${mainProgressPercentage}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Metrics stats */}
+                    <div className="grid grid-cols-3 gap-2 text-center text-xs pt-1">
+                      <div className="bg-emerald-800/40 p-2 rounded-xl border border-emerald-700/30">
+                        <span className="text-[10px] text-emerald-300 block">تم مراجعته</span>
+                        <span className="font-bold text-white text-sm font-mono">{reviewedPagesSoFar} صفحة</span>
+                      </div>
+                      <div className="bg-emerald-800/40 p-2 rounded-xl border border-emerald-700/30">
+                        <span className="text-[10px] text-emerald-300 block">المتبقي من المقرر</span>
+                        <span className="font-bold text-white text-sm font-mono">{remainingMainPages} صفحة</span>
+                      </div>
+                      <div className="bg-emerald-800/40 p-2 rounded-xl border border-emerald-700/30">
+                        <span className="text-[10px] text-emerald-300 block">الأيام المتبقية المقدرة</span>
+                        <span className="font-bold text-amber-300 text-sm font-mono">{estimatedDaysRemaining} يوم</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Actions column */}
+                  <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl flex flex-col justify-between space-y-3">
+                    <div className="space-y-1 text-right">
+                      <h5 className="text-xs font-bold text-emerald-950">تحديث الإنجاز اليومي</h5>
+                      <p className="text-[11px] text-gray-600 leading-snug">
+                        عند إتمام ورد اليوم ({mainDailyPortion} صفحة)، اضغط هنا لتحديث نسبة إنجازك تلقائياً.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <button
+                        onClick={handleRecordMainReviewDailyPortion}
+                        className="w-full py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold shadow-md hover:shadow-lg transition flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Check className="w-4 h-4 stroke-[3]" />
+                        <span>إتمام ورد اليوم (+{mainDailyPortion} ص)</span>
+                      </button>
+
+                      <button
+                        onClick={handleResetMainReviewProgress}
+                        className="w-full py-1.5 bg-white hover:bg-gray-100 text-gray-600 border border-gray-300 rounded-xl text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>إعادة ضبط الحسبة</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              {/* Cumulative Groups section */}
-              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
-                <h3 className="text-lg font-serif font-bold text-emerald-900 border-b border-gray-100 pb-3 flex items-center justify-between">
-                  <span>🧠 المجموعات التراكمية الكبرى (كل 15 مقرراً في حلقة)</span>
-                  <span className="text-xs font-sans text-gray-400 font-normal">مستحسن للمراجعة الشاملة لتعزيز الحفظ طويل المدى</span>
-                </h3>
+              {/* 1. INTENSIVE REVIEW SECTION (Days 2 - 10) */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-amber-500/20 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 pb-3">
+                  <h4 className="text-lg font-serif font-bold text-amber-950 flex items-center gap-2">
+                    <span>🔥 المراجعة المكثفة (الأيام 2 - 10)</span>
+                  </h4>
+                  <span className="text-xs font-bold text-amber-800 bg-amber-50 px-3 py-1 rounded-full border border-amber-200">
+                    مراجعة يومية متتالية بعد الحفظ مباشرة
+                  </span>
+                </div>
+
+                {todayTasks.filter(t => t.type === "review" && t.offset >= 2 && t.offset <= 10).length === 0 ? (
+                  <div className="py-6 text-center text-gray-500 space-y-1">
+                    <p className="text-xs font-semibold text-gray-600">لا توجد مراجعات مكثفة مستحقة اليوم (الأيام 2-10).</p>
+                    <p className="text-[11px] text-gray-400">ستظهر المقررات الحديثة هنا طوال الـ 9 أيام الأولى بعد الحفظ لتثبيتها.</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {todayTasks.filter(t => t.type === "review" && t.offset >= 2 && t.offset <= 10).map(t => {
+                      const sName = getSurahName(t.block.surahId);
+                      return (
+                        <div key={t.block.id} className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 ${
+                          t.isCompleted ? "bg-amber-50/40 border-amber-200/80 opacity-80" : "bg-gradient-to-r from-amber-50/30 to-white border-amber-100 shadow-2xs"
+                        }`}>
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-bold text-gray-800 text-sm">سورة {sName}</span>
+                              <span className="text-[10px] font-bold text-amber-900 bg-amber-100 px-2 py-0.5 rounded-full">
+                                اليوم {t.offset} من 10
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-500">الآيات من {t.block.fromAyah} إلى {t.block.toAyah}</p>
+                            <button 
+                              onClick={() => navigateToMushaf(t.block.surahId, t.block.fromAyah)}
+                              className="text-[10px] font-bold text-emerald-700 hover:underline flex items-center gap-1"
+                            >
+                              📖 فتح الصفحة {getPageForAyah(t.block.surahId, t.block.fromAyah)}
+                            </button>
+                          </div>
+
+                          <button 
+                            onClick={() => handleToggleReviewComplete(t.block.id)}
+                            className={`px-3 py-1.5 text-xs font-bold rounded-xl border transition ${
+                              t.isCompleted ? "bg-amber-600 text-white border-amber-700" : "bg-white hover:bg-amber-50 text-amber-900 border-amber-300"
+                            }`}
+                          >
+                            {t.isCompleted ? "✓ تمت" : "إتمام المراجعة"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* 2. SPACED REVIEW SECTION (Days 12 - 66) */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-blue-500/20 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 pb-3">
+                  <h4 className="text-lg font-serif font-bold text-blue-950 flex items-center gap-2">
+                    <span>🔄 المراجعة المتباعدة (الأيام 12 - 66)</span>
+                  </h4>
+                  <span className="text-xs font-bold text-blue-800 bg-blue-50 px-3 py-1 rounded-full border border-blue-200">
+                    فواصل زمنية (يوم 12، 14، 16، 21، 31، 41، 55، 66)
+                  </span>
+                </div>
+
+                {todayTasks.filter(t => t.type === "review" && t.offset >= 12 && t.offset <= 66).length === 0 ? (
+                  <div className="py-6 text-center text-gray-500 space-y-1">
+                    <p className="text-xs font-semibold text-gray-600">لا توجد مراجعات متباعدة مستحقة اليوم (الأيام 12-66).</p>
+                    <p className="text-[11px] text-gray-400">يتم جدولتها تلقائياً حسب الفواصل الفاصلة للتثبيت طويل المدى.</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {todayTasks.filter(t => t.type === "review" && t.offset >= 12 && t.offset <= 66).map(t => {
+                      const sName = getSurahName(t.block.surahId);
+                      return (
+                        <div key={t.block.id} className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 ${
+                          t.isCompleted ? "bg-blue-50/40 border-blue-200/80 opacity-80" : "bg-gradient-to-r from-blue-50/30 to-white border-blue-100 shadow-2xs"
+                        }`}>
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-bold text-gray-800 text-sm">سورة {sName}</span>
+                              <span className="text-[10px] font-bold text-blue-900 bg-blue-100 px-2 py-0.5 rounded-full">
+                                محطة اليوم {t.offset} من 66
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-500">الآيات من {t.block.fromAyah} إلى {t.block.toAyah}</p>
+                            <button 
+                              onClick={() => navigateToMushaf(t.block.surahId, t.block.fromAyah)}
+                              className="text-[10px] font-bold text-emerald-700 hover:underline flex items-center gap-1"
+                            >
+                              📖 فتح الصفحة {getPageForAyah(t.block.surahId, t.block.fromAyah)}
+                            </button>
+                          </div>
+
+                          <button 
+                            onClick={() => handleToggleReviewComplete(t.block.id)}
+                            className={`px-3 py-1.5 text-xs font-bold rounded-xl border transition ${
+                              t.isCompleted ? "bg-blue-600 text-white border-blue-700" : "bg-white hover:bg-blue-50 text-blue-900 border-blue-300"
+                            }`}
+                          >
+                            {t.isCompleted ? "✓ تمت" : "إتمام المراجعة"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* 3. MAJOR CUMULATIVE GROUPS REVIEW SECTION */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/20 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 pb-3">
+                  <div>
+                    <h4 className="text-lg font-serif font-bold text-emerald-950 flex items-center gap-2">
+                      <span>📚 المجموعات التراكمية الكبرى</span>
+                    </h4>
+                    <p className="text-xs text-gray-500">تجميع المحفوظات في حزم تراكمية (حتى 15 مقرراً لكل حزمة) لربط السور والحفظ الكلي.</p>
+                  </div>
+                  <span className="text-xs font-bold text-emerald-800 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 self-start sm:self-auto">
+                    عدد المجموعات: {cumulativeGroups.length}
+                  </span>
+                </div>
 
                 {cumulativeGroups.length === 0 ? (
-                  <p className="text-sm text-gray-400 text-center py-6">سيتم تعيين المجموعات تلقائيًا بمجرد تجاوز المقررات النشطة حاجز 15 مقرراً مضافاً.</p>
+                  <div className="py-8 text-center text-gray-500 space-y-1">
+                    <p className="text-xs font-semibold text-gray-600">لا توجد مجموعات تراكمية حالياً.</p>
+                    <p className="text-[11px] text-gray-400">عند إضافة مقاطع حفظ متعددة، سيتم تجميعها تلقائياً هنا في حزم لمراجعتها جملة واحدة.</p>
+                  </div>
                 ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {cumulativeGroups.map(g => (
-                      <div key={g.id} className="p-4 rounded-2xl bg-emerald-50/20 border border-emerald-100/50 space-y-3">
-                        <div className="flex items-center justify-between">
-                          <h4 className="font-bold text-emerald-950 text-sm">{g.name}</h4>
-                          <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded">{g.blocks.length} مقرر</span>
+                  <div className="space-y-3">
+                    {cumulativeGroups.map(group => (
+                      <div key={group.id} className="p-4 rounded-2xl bg-gray-50/80 border border-gray-200/80 space-y-3">
+                        <div className="flex items-center justify-between flex-wrap gap-2">
+                          <span className="font-bold text-emerald-900 text-sm">{group.name}</span>
+                          <span className="text-xs font-bold text-gray-600 bg-white px-2.5 py-1 rounded-lg border border-gray-200">
+                            تحتوي على {group.blocks.length} مقاطع حفظ
+                          </span>
                         </div>
-                        <div className="text-xs text-gray-500 space-y-1">
-                          {g.blocks.map(b => (
-                            <span key={b.id} className="inline-block bg-white px-2 py-1 rounded border border-gray-100 ml-1.5 mb-1.5">
-                              سورة {getSurahName(b.surahId)} (الآيات {b.fromAyah} - {b.toAyah})
-                            </span>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
+                          {group.blocks.map(b => (
+                            <button
+                              key={b.id}
+                              onClick={() => navigateToMushaf(b.surahId, b.fromAyah)}
+                              className="p-2 bg-white hover:bg-emerald-50 rounded-xl border border-gray-200 text-right transition group cursor-pointer"
+                            >
+                              <span className="text-xs font-bold text-gray-800 group-hover:text-emerald-900 block">سورة {getSurahName(b.surahId)}</span>
+                              <span className="text-[10px] text-gray-400 block font-mono">آية {b.fromAyah}-{b.toAyah}</span>
+                            </button>
                           ))}
                         </div>
-                        <button 
-                          onClick={() => {
-                            // Select the first block and display page in Mushaf
-                            navigateToMushaf(g.blocks[0].surahId, g.blocks[0].fromAyah);
-                            alert("تم توجيهك إلى المصحف الشريف للبدء في تلاوة المجموعة الكبرى مجمعة.");
-                          }}
-                          className="w-full py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold transition text-center"
-                        >
-                          تلاوة ومراجعة المجموعة مجمعة بالمصحف 📖
-                        </button>
                       </div>
                     ))}
                   </div>
@@ -1141,14 +2133,14 @@ export default function App() {
               exit={{ opacity: 0, y: -10 }}
               className="space-y-6"
             >
-              {/* Role Toggle Card */}
+              {/* Role & Sunnah Header Card */}
               <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
                 <div className="md:col-span-2 space-y-1">
                   <h3 className="text-lg font-serif font-bold text-emerald-900 flex items-center gap-1.5">
-                    <span>🕌 محرك توزيع المراجعة على الصلوات والركعات</span>
+                    <span>🕌 جدول الصلوات الخمس والسنن الرواتب ومحرك التثبيت</span>
                   </h3>
                   <p className="text-xs text-gray-500 leading-relaxed">
-                    يقسم رفيق الحافظ تلقائياً مراجعاتك المفتوحة لتناسب الصلوات. الإمام يستغل الركعات الجهرية والسرية، بينما المأموم يعتمد على ركعات الفرد الصامتة (الظهر، العصر) بجانب السنن الرواتب المؤكدة وقيام الليل.
+                    منظم لصلوات اليوم الخمس بالترتيب الشرعي، مع سننها القبلية والبعدية وتوزيع مقاطع المراجعة على ركعات الفرض والسنن.
                   </p>
                 </div>
 
@@ -1185,78 +2177,176 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Schedule layout mapping */}
-              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
-                <h3 className="text-xl font-serif font-bold text-emerald-900 border-b border-gray-100 pb-3 flex items-center justify-between">
-                  <span>📿 خريطة توزيع ركعات التثبيت لليوم</span>
-                  <span className="text-xs bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded font-sans font-bold">توليد آلي مرن</span>
-                </h3>
-
-                {distributionSlots.length === 0 ? (
-                  <div className="h-44 flex flex-col items-center justify-center text-center space-y-2 text-gray-500">
-                    <CheckCircle className="w-10 h-10 text-emerald-600/20" />
-                    <p className="text-sm font-semibold text-emerald-800">الحمد لله! لا توجد مراجعات مستحقة للتوزيع اليوم.</p>
-                    <p className="text-xs text-gray-400">ستظهر المراجعات المستحقة تلقائياً بعد إضافتك لبلورات الحفظ الجديدة.</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {distributionSlots.map((slot) => {
-                      const isSunnah = slot.prayerType === "sunnah";
-                      const isQiyam = slot.prayerType === "qiyam";
-                      
-                      return (
-                        <div 
-                          key={slot.id} 
-                          className={`p-4 rounded-2xl border transition-all flex items-start justify-between gap-3 ${
-                            isSunnah 
-                              ? "bg-amber-50/20 border-amber-200/50" 
-                              : isQiyam 
-                                ? "bg-purple-50/20 border-purple-200/50" 
-                                : "bg-emerald-50/10 border-emerald-100/50"
-                          }`}
-                        >
-                          <div className="space-y-1">
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="text-xs font-bold text-gray-800">{slot.prayerName}</span>
-                              <span className={`text-[9px] px-2 py-0.5 font-bold rounded-full ${
-                                isSunnah 
-                                  ? "bg-amber-100 text-amber-900" 
-                                  : isQiyam 
-                                    ? "bg-purple-100 text-purple-900" 
-                                    : "bg-emerald-100 text-emerald-900"
-                              }`}>
-                                {isSunnah ? "رواتب وسنن " : isQiyam ? "قيام الليل" : "الفرض "}
+              {/* 5 Daily Prayers Detailed Breakdown */}
+              <div className="space-y-5">
+                {[
+                  { 
+                    key: "الفجر", 
+                    name: "1. صلاة الفجر", 
+                    timeBadge: "الفجر",
+                    icon: "🌅", 
+                    color: "border-sky-200 bg-sky-50/20",
+                    badgeColor: "bg-sky-100 text-sky-900",
+                    sunnahSummary: "سنة الفجر القبلية (ركعتان) ➔ فرض الفجر (ركعتان)" 
+                  },
+                  { 
+                    key: "الضحى", 
+                    name: "سنة الضحى (صلاة الأوابين)", 
+                    timeBadge: "الضحى",
+                    icon: "☀️", 
+                    color: "border-teal-200 bg-teal-50/20",
+                    badgeColor: "bg-teal-100 text-teal-900",
+                    sunnahSummary: `نافلة الضحى (${userProfile.duhaRakats ?? 4} ركعات: من ركعتين إلى 8 ركعات حسب إعداداتك)` 
+                  },
+                  { 
+                    key: "الظهر", 
+                    name: "2. صلاة الظهر", 
+                    timeBadge: "الظهر",
+                    icon: "☀️", 
+                    color: "border-amber-200 bg-amber-50/20",
+                    badgeColor: "bg-amber-100 text-amber-900",
+                    sunnahSummary: "سنة الظهر القبلية (4 ركعات: ركعتين ركعتين) ➔ فرض الظهر (4 ركعات) ➔ سنة الظهر البعدية (ركعتان)" 
+                  },
+                  { 
+                    key: "العصر", 
+                    name: "3. صلاة العصر", 
+                    timeBadge: "العصر",
+                    icon: "🌤️", 
+                    color: "border-orange-200 bg-orange-50/20",
+                    badgeColor: "bg-orange-100 text-orange-900",
+                    sunnahSummary: "فرض العصر (4 ركعات) (صلاة سرية)" 
+                  },
+                  { 
+                    key: "المغرب", 
+                    name: "4. صلاة المغرب", 
+                    timeBadge: "المغرب",
+                    icon: "🌅", 
+                    color: "border-emerald-200 bg-emerald-50/20",
+                    badgeColor: "bg-emerald-100 text-emerald-900",
+                    sunnahSummary: "فرض المغرب (3 ركعات) ➔ سنة المغرب البعدية (ركعتان)" 
+                  },
+                  { 
+                    key: "العشاء", 
+                    name: "5. صلاة العشاء والقيام", 
+                    timeBadge: "العشاء",
+                    icon: "🌙", 
+                    color: "border-indigo-200 bg-indigo-50/20",
+                    badgeColor: "bg-indigo-100 text-indigo-900",
+                    sunnahSummary: "فرض العشاء (4 ركعات) ➔ سنة العشاء البعدية (ركعتان) ➔ صلاة الوتر وقيام الليل" 
+                  }
+                ].map((pInfo) => {
+                  const prayerSlots = distributionSlots.filter(s => s.parentPrayer === pInfo.key);
+                  
+                  return (
+                    <div key={pInfo.key} className={`bg-white rounded-3xl p-5 shadow-sm border-2 ${pInfo.color} space-y-4`}>
+                      {/* Prayer Header */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 pb-3">
+                        <div className="flex items-center gap-2.5">
+                          <span className="text-2xl">{pInfo.icon}</span>
+                          <div>
+                            <h4 className="text-lg font-serif font-bold text-gray-900 flex items-center gap-2">
+                              <span>{pInfo.name}</span>
+                              <span className={`text-xs font-sans px-2.5 py-0.5 rounded-full font-bold ${pInfo.badgeColor}`}>
+                                {pInfo.timeBadge}
                               </span>
-                              <span className="text-[10px] text-gray-400">الركعة {slot.rakahNumber}</span>
-                            </div>
-                            <p className="text-xs text-gray-700 font-medium">سورة التلاوة المستهدفة:</p>
-                            <p className="text-xs text-emerald-800 font-bold bg-[#edf4f0] p-1.5 pr-2.5 rounded-xl border border-emerald-100/50">
-                              {slot.assignedContent}
+                            </h4>
+                            <p className="text-xs text-gray-500 font-medium mt-0.5">
+                              ترتيب الصلاة: <span className="text-emerald-950 font-bold">{pInfo.sunnahSummary}</span>
                             </p>
                           </div>
-
-                          <button 
-                            onClick={() => {
-                              // extract surah name to look up surahId and ayahNum
-                              const match = slot.assignedContent.match(/سورة ([\u0600-\u06FF]+)/);
-                              if (match && match[1]) {
-                                const found = SURAHS.find(s => s.name === match[1]);
-                                if (found) {
-                                  navigateToMushaf(found.id, 1);
-                                  return;
-                                }
-                              }
-                              setActiveTab("mushaf");
-                            }}
-                            className="p-1 px-2 hover:bg-emerald-50 text-emerald-800 text-[10px] font-bold rounded-lg border border-transparent hover:border-emerald-100 transition shrink-0"
-                          >
-                            موضع المصحف ➔
-                          </button>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
+
+                        <span className="text-xs bg-gray-100 text-gray-600 px-3 py-1 rounded-xl font-bold self-start sm:self-auto shrink-0">
+                          عدد مقاطع المراجعة: {prayerSlots.length}
+                        </span>
+                      </div>
+
+                      {/* Reminder Info Banner */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-emerald-50/60 p-2.5 rounded-2xl border border-emerald-100 text-xs">
+                        <div className="flex items-center gap-1.5 font-semibold text-emerald-900">
+                          <Clock className="w-4 h-4 text-emerald-700 shrink-0" />
+                          <span>وقت التذكير المفضل:</span>
+                          <span className="font-bold text-emerald-950 bg-emerald-100/80 px-2 py-0.5 rounded-lg border border-emerald-200">
+                            قبل وقت الصلاة بـ {getPrayerOffsetMinutes(userProfile, pInfo.key)} دقيقة
+                          </span>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleTestPrayerReminderNotification(pInfo.key, distributionSlots)}
+                          className="text-[11px] font-bold text-emerald-800 hover:text-emerald-950 bg-white px-3 py-1 rounded-xl border border-emerald-200 shadow-2xs transition flex items-center gap-1 self-start sm:self-auto cursor-pointer"
+                        >
+                          <Bell className="w-3 h-3 text-emerald-600 shrink-0" />
+                          إرسال تنبيه تجريبي 🔔
+                        </button>
+                      </div>
+
+                      {/* Prayer Slots List */}
+                      {prayerSlots.length === 0 ? (
+                        <div className="p-3 bg-gray-50/70 rounded-2xl border border-dashed border-gray-200 text-center text-xs text-gray-500 font-medium">
+                          لا توجد مراجعات مخصصة لهذه الصلاة حالياً، يمكنك مراجعتها تلاوة أو أداء السنن والنوافل.
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {prayerSlots.map((slot) => {
+                            const isSunnah = slot.prayerType === "sunnah";
+                            const isQiyam = slot.prayerType === "qiyam";
+
+                            return (
+                              <div 
+                                key={slot.id}
+                                className={`p-3.5 rounded-2xl border transition-all flex items-start justify-between gap-3 ${
+                                  isSunnah 
+                                    ? "bg-amber-50/40 border-amber-200/70" 
+                                    : isQiyam 
+                                      ? "bg-purple-50/40 border-purple-200/70" 
+                                      : "bg-emerald-50/30 border-emerald-200/70"
+                                }`}
+                              >
+                                <div className="space-y-1">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="text-xs font-bold text-gray-900">{slot.prayerName}</span>
+                                    <span className={`text-[9px] px-2 py-0.5 font-bold rounded-full ${
+                                      isSunnah 
+                                        ? "bg-amber-100 text-amber-900" 
+                                        : isQiyam 
+                                          ? "bg-purple-100 text-purple-900" 
+                                          : "bg-emerald-100 text-emerald-900"
+                                    }`}>
+                                      {isSunnah ? "سنة " : isQiyam ? "قيام " : "الفرض "}
+                                    </span>
+                                    <span className="text-[10px] text-gray-400 font-mono">الركعة {slot.rakahNumber}</span>
+                                  </div>
+                                  <p className="text-xs text-gray-600 font-medium">سورة التلاوة المستهدفة:</p>
+                                  <p className="text-xs text-emerald-900 font-bold bg-white p-1.5 pr-2.5 rounded-xl border border-emerald-100 shadow-2xs">
+                                    {slot.assignedContent}
+                                  </p>
+                                </div>
+
+                                <button 
+                                  onClick={() => {
+                                    const match = slot.assignedContent.match(/سورة ([\u0600-\u06FF]+)/);
+                                    if (match && match[1]) {
+                                      const found = SURAHS.find(s => s.name === match[1]);
+                                      if (found) {
+                                        navigateToMushaf(found.id, 1);
+                                        return;
+                                      }
+                                    }
+                                    setActiveTab("mushaf");
+                                  }}
+                                  className="p-1 px-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded-lg border border-emerald-200 transition shrink-0 self-center"
+                                >
+                                  المصحف ➔
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </motion.div>
           )}
@@ -1274,35 +2364,57 @@ export default function App() {
               <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                   <div className="space-y-1">
-                    <h3 className="text-lg font-serif font-bold text-emerald-900">📘 المصحف الشريف (المدينة المنورة المصور)</h3>
-                    <p className="text-xs text-gray-500">انتقل مباشرة مابين أرقام الصفحات (1 - 604) أو اختر السورة لتحديد الموضع</p>
+                    <h3 className="text-lg font-serif font-bold text-emerald-900 flex items-center gap-2">
+                      <BookOpen className="w-5 h-5 text-emerald-700" />
+                      <span>📘 المصحف الشريف (المدينة المنورة - طبعة مجمع الملك فهد)</span>
+                    </h3>
+                    <p className="text-xs text-gray-500">تصفح المصحف كاملاً (604 صفحة) بقراءة مصورة أو نصية تفاعلية مع حماية أوفلاين</p>
                   </div>
 
-                  <div className="flex gap-2">
-                    <button 
-                      onClick={() => setMushafViewMode("image")}
-                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition ${
-                        mushafViewMode === "image" ? "bg-emerald-800 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                  {/* Mode switcher tabs & Quick Night Mode toggle */}
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => {
+                        const updated = { ...state, profile: { ...userProfile, mushafNightMode: !userProfile.mushafNightMode } };
+                        updateState(updated);
+                      }}
+                      title="التحكم بالوضع الليلي للمصحف"
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border shrink-0 ${
+                        userProfile.mushafNightMode 
+                          ? "bg-slate-900 text-amber-300 border-amber-400/40 shadow-inner" 
+                          : "bg-amber-50 text-amber-900 border-amber-200 hover:bg-amber-100"
                       }`}
                     >
-                      مصحف مصوّر (رسم عثماني)
+                      {userProfile.mushafNightMode ? <Moon className="w-3.5 h-3.5 text-amber-300 fill-amber-300/30" /> : <Sun className="w-3.5 h-3.5 text-amber-600" />}
+                      <span>{userProfile.mushafNightMode ? "الوضع الليلي 🌙" : "الوضع العادي ☀️"}</span>
                     </button>
-                    <button 
-                      onClick={() => setMushafViewMode("offline")}
-                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition ${
-                        mushafViewMode === "offline" ? "bg-emerald-800 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                      }`}
-                    >
-                      عناوين الأجزاء والسور
-                    </button>
+
+                    <div className="flex gap-1.5 bg-gray-100 p-1 rounded-2xl shrink-0">
+                      <button 
+                        onClick={() => { setMushafViewMode("image"); setMushafImgFailed(false); }}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1 ${
+                          mushafViewMode === "image" ? "bg-emerald-800 text-white shadow-sm" : "text-gray-600 hover:text-emerald-800"
+                        }`}
+                      >
+                        <span>مصحف مصوّر</span>
+                      </button>
+                      <button 
+                        onClick={() => setMushafViewMode("offline")}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1 ${
+                          mushafViewMode === "offline" ? "bg-emerald-800 text-white shadow-sm" : "text-gray-600 hover:text-emerald-800"
+                        }`}
+                      >
+                        <span>فهرس السور والنصوص</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-gray-50 p-4 rounded-2xl border border-gray-100 font-sans">
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3 bg-gray-50 p-4 rounded-2xl border border-gray-100 font-sans text-xs">
                   
-                  {/* Select Surah and slide */}
+                  {/* Select Surah for quick jump */}
                   <div className="space-y-1">
-                    <label className="text-xs font-bold text-gray-500">اختر السورة للانتقال السريع</label>
+                    <label className="font-bold text-gray-600 block">اختر السورة للانتقال</label>
                     <select 
                       value={searchSurahId}
                       onChange={(e) => {
@@ -1313,18 +2425,18 @@ export default function App() {
                           setMushafPage(s.startPage);
                         }
                       }}
-                      className="w-full px-3 py-1.5 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-white"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-white font-medium"
                     >
                       {SURAHS.map((s) => (
-                        <option key={s.id} value={s.id}>{s.id}. {s.name} ({s.startPage} ص)</option>
+                        <option key={s.id} value={s.id}>{s.id}. سورة {s.name} (ص {s.startPage})</option>
                       ))}
                     </select>
                   </div>
 
-                  {/* Manual page page number input */}
+                  {/* Manual Page Number Input */}
                   <div className="space-y-1">
-                    <label className="text-xs font-bold text-gray-500">ادخل رقم الصفحة مباشرة</label>
-                    <div className="flex gap-2">
+                    <label className="font-bold text-gray-600 block">رقم الصفحة المباشر</label>
+                    <div className="flex gap-2 items-center">
                       <input 
                         type="number"
                         min="1"
@@ -1336,165 +2448,267 @@ export default function App() {
                             setMushafPage(val);
                           }
                         }}
-                        className="w-full px-3 py-1.5 border border-gray-300 rounded-xl text-center focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-white font-mono"
+                        className="w-full px-3 py-1.5 border border-gray-300 rounded-xl text-center focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-white font-mono font-bold text-emerald-900"
                       />
-                      <span className="text-xs self-center font-bold text-gray-400">/ 604</span>
+                      <span className="text-gray-400 font-bold whitespace-nowrap">/ 604</span>
                     </div>
                   </div>
 
-                  {/* Cache action & storage indicator */}
+                  {/* Quick Jump Shortcuts (+10 / -10) */}
+                  <div className="space-y-1">
+                    <label className="font-bold text-gray-600 block">تنقل سريع للصفحات</label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button 
+                        onClick={() => setMushafPage(p => Math.max(1, p - 10))}
+                        className="py-1.5 bg-white hover:bg-emerald-50 border border-gray-200 text-gray-700 font-bold rounded-xl text-center transition"
+                      >
+                        10- صفحات
+                      </button>
+                      <button 
+                        onClick={() => setMushafPage(p => Math.min(604, p + 10))}
+                        className="py-1.5 bg-white hover:bg-emerald-50 border border-gray-200 text-gray-700 font-bold rounded-xl text-center transition"
+                      >
+                        10+ صفحات
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Cache / Offline Marker */}
                   <div className="space-y-1 flex flex-col justify-end">
                     <button 
-                      onClick={handleDownloadSurah}
-                      disabled={downloadingSurah}
-                      className={`w-full py-2 px-3 border rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
-                        downloadingSurah
-                          ? "bg-gray-100 border-gray-200 text-gray-400"
-                          : "bg-white hover:bg-gray-50 border-gray-300 text-gray-700"
+                      onClick={() => {
+                        const isCached = state.mushafCache.includes(mushafPage);
+                        let updatedCached: number[];
+                        if (isCached) {
+                          updatedCached = state.mushafCache.filter(p => p !== mushafPage);
+                        } else {
+                          updatedCached = [...state.mushafCache, mushafPage];
+                        }
+                        updateState({ ...state, mushafCache: updatedCached });
+                      }}
+                      className={`w-full py-2 px-3 border rounded-xl font-bold flex items-center justify-center gap-1.5 transition ${
+                        state.mushafCache.includes(mushafPage) 
+                          ? "bg-emerald-100 border-emerald-300 text-emerald-900" 
+                          : "bg-white hover:bg-gray-100 border-gray-300 text-gray-700"
                       }`}
                     >
-                      {downloadingSurah ? (
-                        <span>جاري التحميل... {downloadProgress}%</span>
-                      ) : (
-                        <>
-                          <Download className="w-3.5 h-3.5" />
-                          <span>تحميل السورة للأوفلاين</span>
-                        </>
-                      )}
+                      <Check className={`w-3.5 h-3.5 ${state.mushafCache.includes(mushafPage) ? "opacity-100" : "opacity-30"}`} />
+                      <span>{state.mushafCache.includes(mushafPage) ? "صفحة مرجعية محفوظة" : "حفظ الصفحة للمفضلة"}</span>
                     </button>
                   </div>
+
                 </div>
               </div>
 
               {/* MUSHAF DIGITAL CANVAS Frame */}
-              <div className="bg-[#f0ede6] min-h-[600px] border-4 border-[#3a352c]/20 shadow-lg rounded-3xl p-4 flex flex-col md:flex-row justify-between items-center gap-4 relative">
+              <div className={`min-h-[620px] border-4 shadow-lg rounded-3xl p-3 md:p-6 flex flex-col md:flex-row justify-between items-center gap-4 relative transition-colors duration-300 ${
+                userProfile.mushafNightMode 
+                  ? "bg-[#111317] border-[#252830]" 
+                  : "bg-[#f0ede6] border-[#3a352c]/20"
+              }`}>
                 
-                {/* Navigation triggers */}
+                {/* Navigation: Previous Page Button (Turn Right in RTL) */}
                 <button 
                   onClick={() => mushafPage > 1 && setMushafPage(prev => prev - 1)}
                   disabled={mushafPage === 1}
-                  className="p-3 bg-[#e2dec9] hover:bg-[#d5d0b6] disabled:opacity-40 text-[#4c4436] rounded-full shadow-inner tracking-tight transition shrink-0"
+                  title="الصفحة السابقة"
+                  className={`p-3 rounded-full shadow-md transition shrink-0 flex items-center justify-center disabled:opacity-30 ${
+                    userProfile.mushafNightMode 
+                      ? "bg-[#1e2229] hover:bg-[#282d37] text-amber-300 border border-gray-800" 
+                      : "bg-[#e2dec9] hover:bg-[#d5d0b6] text-[#4c4436]"
+                  }`}
                 >
-                  <ChevronRight className="w-6 h-6 shrink-0" />
+                  <ChevronRight className="w-7 h-7 shrink-0" />
                 </button>
 
-                {/* Main render sheet */}
-                <div className="flex-1 w-full bg-white rounded-2xl shadow-sm p-4 min-h-[500px] text-center flex flex-col justify-between items-center relative select-text">
+                {/* Main Render Sheet */}
+                <div className={`flex-1 w-full rounded-2xl shadow-sm p-4 md:p-6 min-h-[520px] text-center flex flex-col justify-between items-center relative select-text border transition-colors duration-300 ${
+                  userProfile.mushafNightMode 
+                    ? "bg-[#181a1f] border-[#282d36] text-gray-100" 
+                    : "bg-white border-[#e2dec9] text-gray-900"
+                }`}>
                   
-                  {mushafViewMode === "image" ? (
-                    <div className="w-full flex flex-col items-center">
-                      <div className="text-[10px] text-gray-400 font-mono tracking-wider w-full mb-3 flex items-center justify-between border-b pb-1.5">
-                        <span className="flex items-center gap-1">
-                          الصفحة {mushafPage}
-                          {isCached && <CheckCircle className="w-3 h-3 text-emerald-600" title="محفوظة أوفلاين" />}
-                        </span>
-                        <span>مصحف مجمع الملك فهد لطباعة المصحف الشريف</span>
-                        <span>رسم عثماني</span>
+                  {mushafViewMode === "image" && !mushafImgFailed ? (
+                    <div className="w-full flex flex-col items-center relative">
+                      {/* Page Header Info */}
+                      <div className={`text-[11px] font-bold font-serif w-full mb-3 flex items-center justify-between border-b pb-2 px-1 ${
+                        userProfile.mushafNightMode ? "border-gray-800 text-amber-300" : "border-gray-100 text-emerald-900"
+                      }`}>
+                        <span className={`px-2.5 py-0.5 rounded-lg border ${
+                          userProfile.mushafNightMode ? "bg-slate-900 border-slate-700 text-amber-300" : "bg-emerald-50 border-emerald-100 text-emerald-900"
+                        }`}>الصفحة {mushafPage}</span>
+                        <span className={`hidden sm:inline ${userProfile.mushafNightMode ? "text-gray-400" : "text-gray-500"}`}>مصحف مجمع الملك فهد لطباعة المصحف الشريف</span>
+                        <span className={`px-2.5 py-0.5 rounded-lg border ${
+                          userProfile.mushafNightMode ? "bg-slate-900 border-slate-700 text-amber-300" : "bg-emerald-50 border-emerald-100 text-emerald-900"
+                        }`}>الحزب {Math.ceil(mushafPage / 10)}</span>
                       </div>
                       
-                      {imageLoading && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10 rounded-2xl">
-                          <div className="flex flex-col items-center space-y-3">
-                            <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent rounded-full animate-spin"></div>
-                            <p className="text-xs text-emerald-800 font-bold">جاري عرض الصفحة...</p>
-                          </div>
+                      {/* Loading Spinner */}
+                      {mushafImgLoading && (
+                        <div className="py-24 flex flex-col items-center justify-center space-y-3">
+                          <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent rounded-full animate-spin"></div>
+                          <p className={`text-xs font-bold ${userProfile.mushafNightMode ? "text-amber-300" : "text-gray-500"}`}>جاري تحميل صورة الصفحة {mushafPage} من المصحف...</p>
                         </div>
                       )}
 
-                      {imageError ? (
-                        <div className="h-[60vh] flex flex-col items-center justify-center space-y-6 text-gray-500 px-6 bg-gray-50/50 rounded-2xl border-2 border-dashed border-gray-200">
-                          <div className="text-center space-y-2">
-                            <AlertCircle className="w-16 h-16 text-amber-500 mx-auto" />
-                            <h4 className="text-lg font-bold text-gray-800">تعذر عرض صفحة المصحف</h4>
-                            <p className="text-xs text-gray-500 leading-relaxed">
-                              قد يكون الاتصال بالإنترنت ضعيفاً أو أن مزود الخدمة يحجب رابط الصور. <br/>
-                              يمكنك محاولة التحميل مرة أخرى أو الانتقال للوضع "أوفلاين" لعرض الفهرس.
-                            </p>
+                      {/* Multi-CDN High-Quality Page Image (With Night Mode Filter) */}
+                      <img 
+                        referrerPolicy="no-referrer"
+                        src={QURAN_PAGE_CDNS[mushafCdnIndex](mushafPage)} 
+                        alt={`Quran Page ${mushafPage}`} 
+                        style={userProfile.mushafNightMode ? { filter: "invert(0.92) hue-rotate(180deg) brightness(0.88) contrast(1.15)" } : undefined}
+                        className={`max-h-[72vh] w-auto object-contain mx-auto transition-all duration-300 ${
+                          mushafImgLoading ? "opacity-0 absolute inset-0" : "opacity-100"
+                        }`}
+                        onLoad={() => {
+                          setMushafImgLoading(false);
+                          setMushafImgFailed(false);
+                        }}
+                        onError={() => {
+                          if (mushafCdnIndex < QURAN_PAGE_CDNS.length - 1) {
+                            setMushafCdnIndex(prev => prev + 1);
+                            setMushafImgLoading(true);
+                          } else {
+                            setMushafImgLoading(false);
+                            setMushafImgFailed(true);
+                          }
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    /* Digital Text & Surahs Explorer Mode */
+                    <div className="w-full text-right p-2 md:p-4 space-y-6">
+                      
+                      {/* Header for text mode */}
+                      <div className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b pb-3 ${
+                        userProfile.mushafNightMode ? "border-gray-800" : "border-gray-200"
+                      }`}>
+                        <div>
+                          <h4 className={`text-xl font-serif font-bold ${userProfile.mushafNightMode ? "text-amber-300" : "text-emerald-950"}`}>
+                            📖 الصفحة {mushafPage} (النص الإلكتروني المكتوب)
+                          </h4>
+                          <p className={`text-xs ${userProfile.mushafNightMode ? "text-gray-400" : "text-gray-500"}`}>تلاوة وقراءة النص العثماني لآيات الصفحة مباشرة</p>
+                        </div>
+
+                        <button 
+                          onClick={() => {
+                            setMushafCdnIndex(0);
+                            setMushafImgFailed(false);
+                            setMushafImgLoading(true);
+                            setMushafViewMode("image");
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition shrink-0 ${
+                            userProfile.mushafNightMode ? "bg-slate-800 hover:bg-slate-700 text-amber-300 border-slate-700" : "bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200"
+                          }`}
+                        >
+                          🔄 إعادة تجربة جلب الصورة المصورة
+                        </button>
+                      </div>
+
+                      {/* Digital Text Viewer / Loading state */}
+                      {loadingPageText ? (
+                        <div className="py-16 text-center space-y-3">
+                          <div className="w-8 h-8 border-3 border-emerald-600 border-t-transparent rounded-full animate-spin mx-auto"></div>
+                          <p className={`text-xs font-bold ${userProfile.mushafNightMode ? "text-amber-300" : "text-gray-500"}`}>جاري تحميل الآيات العثمانية للصفحة {mushafPage}...</p>
+                        </div>
+                      ) : pageTextData && pageTextData.ayahs.length > 0 ? (
+                        <div className={`p-6 rounded-2xl border space-y-4 ${
+                          userProfile.mushafNightMode ? "bg-[#21252b] border-[#2e343f]" : "bg-[#fcfbf9] border-[#e8e4d8]"
+                        }`}>
+                          <div className={`text-center font-serif text-lg font-bold py-2 rounded-xl border ${
+                            userProfile.mushafNightMode ? "bg-emerald-950/80 text-amber-300 border-emerald-800/50" : "bg-emerald-50/80 text-emerald-900 border-emerald-100"
+                          }`}>
+                            سورة {pageTextData.surahName}
                           </div>
 
-                          <div className="flex gap-3">
-                            <button
-                              onClick={() => {
-                                setImageError(false);
-                                setImageLoading(true);
-                                const img = document.getElementById("mushaf-img") as HTMLImageElement;
-                                if (img) {
-                                  const currentSrc = img.src.split('?')[0];
-                                  img.src = `${currentSrc}?t=${Date.now()}`;
-                                }
-                              }}
-                              className="px-6 py-2.5 bg-emerald-700 text-white rounded-xl font-bold shadow-md hover:bg-emerald-800 transition flex items-center gap-2"
-                            >
-                              <RotateCcw className="w-4 h-4" />
-                              إعادة المحاولة
-                            </button>
-                            <button
-                              onClick={() => setMushafViewMode("offline")}
-                              className="px-6 py-2.5 bg-white text-gray-700 border border-gray-300 rounded-xl font-bold transition"
-                            >
-                              عرض الفهرس
-                            </button>
+                          <div className={`leading-[2.6] text-xl font-serif text-justify dir-rtl p-2 ${
+                            userProfile.mushafNightMode ? "text-amber-100" : "text-gray-900"
+                          }`}>
+                            {pageTextData.ayahs.map((a, idx) => (
+                              <span key={idx} className="inline">
+                                <span className={`transition rounded px-1 ${
+                                  userProfile.mushafNightMode ? "hover:bg-slate-800" : "hover:bg-amber-100"
+                                }`}>{a.text}</span>
+                                <span className={`inline-flex items-center justify-center w-7 h-7 mx-1 text-xs font-bold rounded-full border font-mono align-middle ${
+                                  userProfile.mushafNightMode ? "bg-amber-950/60 text-amber-300 border-amber-800" : "bg-emerald-50 text-emerald-800 border-emerald-200"
+                                }`}>
+                                  {a.numberInSurah}
+                                </span>
+                              </span>
+                            ))}
                           </div>
                         </div>
                       ) : (
-                        <img
-                          id="mushaf-img"
-                          src={quranPageUrl(mushafPage)}
-                          alt={`Quran Page ${mushafPage}`}
-                          className={`max-h-[75vh] w-auto object-contain mx-auto select-none pointer-events-none transition-opacity duration-500 ${imageLoading ? 'opacity-0' : 'opacity-100'}`}
-                          onLoad={() => {
-                            setImageLoading(false);
-                            checkCacheStatus(mushafPage);
-                          }}
-                          onError={() => {
-                            setImageLoading(false);
-                            setImageError(true);
-                          }}
-                        />
-                      )}
-                    </div>
-                  ) : (
-                    // Typographic Quran Verses Frame Explorer
-                    <div className="w-full text-right p-4 space-y-6">
-                      <h4 className="text-xl font-bold font-serif text-emerald-950 pb-2 border-b border-gray-100 flex items-center justify-between">
-                        <span>📖 فهرس سور المصحف ومقررات الحفظ</span>
-                        <span className="text-xs font-sans text-gray-400 font-normal">تصفح ورصد</span>
-                      </h4>
-
-                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                        {SURAHS.map((s) => (
-                          <div 
-                            key={s.id} 
-                            onClick={() => {
-                              setSearchSurahId(s.id);
-                              setMushafPage(s.startPage);
-                              setMushafViewMode("image");
-                            }}
-                            className="p-3 bg-gray-50 border hover:border-emerald-600 rounded-xl cursor-pointer hover:bg-emerald-50 transition"
-                          >
-                            <span className="text-xs font-mono text-gray-400 font-normal ml-1.5">#{s.id}</span>
-                            <span className="font-bold text-emerald-900 text-sm">سورة {s.name}</span>
-                            <span className="text-[10px] text-gray-450 block font-normal">تبدأ بالصفحة {s.startPage} • {s.ayahs} آية</span>
+                        /* Index of Surahs Fallback */
+                        <div className="space-y-4">
+                          <h4 className={`text-sm font-bold ${userProfile.mushafNightMode ? "text-amber-300" : "text-gray-700"}`}>فهرس سور القرآن الكريم:</h4>
+                          <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5">
+                            {SURAHS.map((s) => (
+                              <div 
+                                key={s.id} 
+                                onClick={() => {
+                                  setSearchSurahId(s.id);
+                                  setMushafPage(s.startPage);
+                                  setMushafViewMode("image");
+                                }}
+                                className={`p-3 border rounded-xl cursor-pointer transition ${
+                                  userProfile.mushafNightMode ? "bg-[#21252b] border-[#2e343f] hover:bg-slate-800 text-amber-200" : "bg-gray-50 hover:border-emerald-600 hover:bg-emerald-50 text-gray-800"
+                                }`}
+                              >
+                                <span className="text-xs font-mono text-gray-400 font-normal ml-1.5">#{s.id}</span>
+                                <span className={`font-bold text-sm ${userProfile.mushafNightMode ? "text-amber-300" : "text-emerald-900"}`}>سورة {s.name}</span>
+                                <span className="text-[10px] text-gray-400 block">صفحة {s.startPage} • {s.ayahs} آية</span>
+                              </div>
+                            ))}
                           </div>
-                        ))}
-                      </div>
+                        </div>
+                      )}
+
                     </div>
                   )}
 
-                  <div className="w-full text-[10px] text-gray-400 font-mono tracking-wider pt-3 border-t flex justify-between items-center mt-3">
-                    <span>رقم المجلد: 1</span>
-                    <span>الصفحة {mushafPage} / 604</span>
+                  {/* Page Footer Navigation Bar */}
+                  <div className={`w-full text-xs font-bold font-sans pt-3 border-t flex flex-col sm:flex-row justify-between items-center gap-2 mt-3 ${
+                    userProfile.mushafNightMode ? "border-gray-800 text-gray-400" : "border-gray-100 text-gray-500"
+                  }`}>
+                    <span>الصفحة {mushafPage} من 604</span>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => setMushafPage(p => Math.max(1, p - 1))}
+                        disabled={mushafPage === 1}
+                        className={`px-3 py-1 rounded-lg disabled:opacity-30 transition ${
+                          userProfile.mushafNightMode ? "bg-slate-800 hover:bg-slate-700 text-amber-200" : "bg-gray-100 hover:bg-emerald-100 text-gray-700"
+                        }`}
+                      >
+                        السابقة ➔
+                      </button>
+                      <button 
+                        onClick={() => setMushafPage(p => Math.min(604, p + 1))}
+                        disabled={mushafPage === 604}
+                        className={`px-3 py-1 rounded-lg disabled:opacity-30 transition ${
+                          userProfile.mushafNightMode ? "bg-slate-800 hover:bg-slate-700 text-amber-200" : "bg-gray-100 hover:bg-emerald-100 text-gray-700"
+                        }`}
+                      >
+                        ⬅ التالية
+                      </button>
+                    </div>
                     <span>الحزب {Math.ceil(mushafPage / 10)}</span>
                   </div>
 
                 </div>
 
+                {/* Navigation: Next Page Button (Turn Left in RTL) */}
                 <button 
                   onClick={() => mushafPage < 604 && setMushafPage(prev => prev + 1)}
                   disabled={mushafPage === 604}
-                  className="p-3 bg-[#e2dec9] hover:bg-[#d5d0b6] disabled:opacity-40 text-[#4c4436] rounded-full shadow-inner tracking-tight transition shrink-0"
+                  title="الصفحة التالية"
+                  className={`p-3 rounded-full shadow-md transition shrink-0 flex items-center justify-center disabled:opacity-30 ${
+                    userProfile.mushafNightMode 
+                      ? "bg-[#1e2229] hover:bg-[#282d37] text-amber-300 border border-gray-800" 
+                      : "bg-[#e2dec9] hover:bg-[#d5d0b6] text-[#4c4436]"
+                  }`}
                 >
-                  <ChevronLeft className="w-6 h-6 shrink-0" />
+                  <ChevronLeft className="w-7 h-7 shrink-0" />
                 </button>
 
               </div>
@@ -1510,6 +2724,83 @@ export default function App() {
               exit={{ opacity: 0, y: -10 }}
               className="space-y-6"
             >
+              {/* Active Track Selection Card */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
+                <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <div className="p-2 bg-emerald-50 text-emerald-700 rounded-xl">
+                      <Compass className="w-5 h-5 shrink-0" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-serif font-bold text-emerald-900">
+                        🔀 تحديد مسار البرنامج النشط
+                      </h3>
+                      <p className="text-xs text-gray-500">اختر المسار الذي يناسب طريقة المراجعة والحفظ المطلوبة</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+                  {/* Option 1: Hifz & Review */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const updated = { ...state, profile: { ...userProfile, appTrack: "hifz_and_review" as const } };
+                      updateState(logActivity(updated, "تحديد المسار", "تم اختيار مسار الحفظ والمراجعة"));
+                    }}
+                    className={`p-5 rounded-2xl border text-right transition flex flex-col justify-between space-y-3 cursor-pointer ${
+                      (userProfile.appTrack || "hifz_and_review") === "hifz_and_review"
+                        ? "bg-emerald-50/90 border-emerald-600 shadow-sm ring-2 ring-emerald-500/20"
+                        : "bg-gray-50 border-gray-200 hover:bg-gray-100/80"
+                    }`}
+                  >
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-emerald-950 text-sm flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-emerald-600"></span>
+                          مسار الحفظ والمراجعة
+                        </span>
+                        {(userProfile.appTrack || "hifz_and_review") === "hifz_and_review" && (
+                          <span className="text-[10px] bg-emerald-700 text-white font-bold px-2.5 py-0.5 rounded-full">نشط حالياً</span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-600 leading-relaxed">
+                        مخصص للطلاب للحفظ الجديد مع عداد مائة التكرار والمراجعات التراكمية المتباعدة تلقائياً.
+                      </p>
+                    </div>
+                  </button>
+
+                  {/* Option 2: Review Only */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const updated = { ...state, profile: { ...userProfile, appTrack: "review_only" as const } };
+                      updateState(logActivity(updated, "تحديد المسار", "تم اختيار مسار المراجعة فقط"));
+                    }}
+                    className={`p-5 rounded-2xl border text-right transition flex flex-col justify-between space-y-3 cursor-pointer ${
+                      userProfile.appTrack === "review_only"
+                        ? "bg-blue-50/90 border-blue-600 shadow-sm ring-2 ring-blue-500/20"
+                        : "bg-gray-50 border-gray-200 hover:bg-gray-100/80"
+                    }`}
+                  >
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-blue-950 text-sm flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-blue-600"></span>
+                          مسار المراجعة فقط
+                        </span>
+                        {userProfile.appTrack === "review_only" && (
+                          <span className="text-[10px] bg-blue-700 text-white font-bold px-2.5 py-0.5 rounded-full">نشط حالياً</span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-600 leading-relaxed">
+                        مخصص للحُفّاظ لمراجعة القرآن كاملاً بتسلسل محدد (من البقرة إلى الناس أو العكس أو بالسورة والآيات) وتوزيعه على الصلوات.
+                      </p>
+                    </div>
+                  </button>
+                </div>
+              </div>
+
               {/* Profile Config */}
               <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
                 <h3 className="text-lg font-serif font-bold text-emerald-900 border-b border-gray-100 pb-3">
@@ -1546,15 +2837,34 @@ export default function App() {
                   </div>
 
                   <div className="space-y-1">
+                    <label className="text-xs font-bold text-gray-600 block">عدد ركعات سنة الضحى</label>
+                    <select 
+                      value={userProfile.duhaRakats ?? 4}
+                      onChange={(e) => {
+                        const updated = { ...state, profile: { ...userProfile, duhaRakats: Number(e.target.value) } };
+                        updateState(updated);
+                      }}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-gray-50 text-xs font-bold"
+                    >
+                      <option value="0">بدون (لا أرغب بالمراجعة في صلاة الضحى)</option>
+                      <option value="2">ركعتان (أقل الضحى)</option>
+                      <option value="4">4 ركعات (مستحسنة)</option>
+                      <option value="6">6 ركعات</option>
+                      <option value="8">8 ركعات (أكثرها وصحّت عن النبي ﷺ)</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
                     <label className="text-xs font-bold text-gray-600 block">عدد ركعات نافلة قيام الليل</label>
                     <select 
-                      value={userProfile.nightPrayerRakats}
+                      value={userProfile.nightPrayerRakats ?? 0}
                       onChange={(e) => {
                         const updated = { ...state, profile: { ...userProfile, nightPrayerRakats: Number(e.target.value) } };
                         updateState(updated);
                       }}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-gray-50"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 bg-gray-50 text-xs font-bold"
                     >
+                      <option value="0">بدون (لا أرغب بالمراجعة في قيام الليل)</option>
                       <option value="2">ركعتان</option>
                       <option value="4">4 ركعات</option>
                       <option value="8">8 ركعات (مستحسن)</option>
@@ -1595,6 +2905,341 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Mushaf Night Mode Toggle Card */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-4">
+                <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-2.5 bg-slate-900 text-amber-400 rounded-2xl shadow-sm">
+                      <Moon className="w-5 h-5 shrink-0 fill-amber-400/20" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-serif font-bold text-emerald-900">
+                        🌙 الوضع الليلي المخصص للمصحف الشريف
+                      </h3>
+                      <p className="text-xs text-gray-500">تغيير ألوان خلفية وصفحات المصحف لتكون مريحة للعين أثناء القراءة في الإضاءة الخافتة</p>
+                    </div>
+                  </div>
+
+                  {/* Toggle Switch */}
+                  <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                    <input 
+                      type="checkbox" 
+                      id="sett_mushafNightMode"
+                      checked={!!userProfile.mushafNightMode}
+                      onChange={(e) => {
+                        const updated = { ...state, profile: { ...userProfile, mushafNightMode: e.target.checked } };
+                        updateState(updated);
+                      }}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-800"></div>
+                  </label>
+                </div>
+
+                <div className="flex items-center justify-between p-3.5 bg-gray-50 rounded-2xl border border-gray-100">
+                  <div className="space-y-0.5">
+                    <label htmlFor="sett_mushafNightMode" className="text-xs font-bold text-gray-800 block cursor-pointer">
+                      تفعيل الخلفية الليلية الداكنة لصفحات وآيات المصحف
+                    </label>
+                    <span className="text-[11px] text-gray-500 block leading-relaxed">
+                      يعمل هذا الخيار على تكييف ألوان الصفحات المصورة والنصوص العثمانية تلقائياً لتقليل إجهاد العين وحمايتها ليلاً
+                    </span>
+                  </div>
+                  <span className={`text-xs font-bold px-3 py-1.5 rounded-xl border shrink-0 ${
+                    userProfile.mushafNightMode 
+                      ? "bg-slate-900 text-amber-300 border-slate-800" 
+                      : "bg-amber-50 text-amber-800 border-amber-200"
+                  }`}>
+                    {userProfile.mushafNightMode ? "مفعّل 🌙" : "معطّل ☀️"}
+                  </span>
+                </div>
+              </div>
+
+              {/* Notification Control Card */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-5">
+                <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <div className="p-2 bg-emerald-50 text-emerald-700 rounded-xl">
+                      <BellRing className="w-5 h-5 shrink-0" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-serif font-bold text-emerald-900">
+                        🔔 التحكم بالإشعارات والتنبيهات
+                      </h3>
+                      <p className="text-xs text-gray-500">إدارة تذكيرات الصلوات ومراجعة ورد القرآن الكريم</p>
+                    </div>
+                  </div>
+
+                  {/* Permission Badge */}
+                  {notifPermission === "granted" ? (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-100 text-emerald-800 text-xs font-bold rounded-full border border-emerald-200">
+                      <Check className="w-3.5 h-3.5" />
+                      مفعّلة في المتصفح
+                    </span>
+                  ) : notifPermission === "denied" ? (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-red-100 text-red-800 text-xs font-bold rounded-full border border-red-200">
+                      <AlertCircle className="w-3.5 h-3.5" />
+                      محظورة بالمتصفح
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-100 text-amber-800 text-xs font-bold rounded-full border border-amber-200">
+                      <BellOff className="w-3.5 h-3.5" />
+                      غير مفعّلة
+                    </span>
+                  )}
+                </div>
+
+                {/* Permission Request / Test Notification Banner */}
+                {notifPermission !== "granted" ? (
+                  <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-xs font-bold text-amber-900">إذن الإشعارات لم يتم منحه بعد</p>
+                      <p className="text-[11px] text-amber-700 leading-relaxed">
+                        قم بتفعيل إذن الإشعارات لتصلك تنبيهات أوقات الأذان والتذكير بمراجعة أورادك اليومية.
+                      </p>
+                    </div>
+                    <button
+                      onClick={handleRequestNotifPermission}
+                      className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition shadow-sm shrink-0 flex items-center gap-1.5"
+                    >
+                      <Bell className="w-4 h-4" />
+                      منح إذن الإشعارات
+                    </button>
+                  </div>
+                ) : (
+                  <div className="p-3.5 bg-emerald-50/60 border border-emerald-100 rounded-2xl flex items-center justify-between gap-3">
+                    <span className="text-xs text-emerald-900 font-medium">الإشعارات مفعّلة وجاهزة للعمل</span>
+                    <button
+                      onClick={handleTestNotification}
+                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-sm"
+                    >
+                      <Bell className="w-3.5 h-3.5" />
+                      إرسال إشعار تجريبي 🔔
+                    </button>
+                  </div>
+                )}
+
+                {/* Specific Toggles */}
+                <div className="space-y-3 pt-1">
+                  <div className="flex items-center justify-between p-3 bg-gray-50 rounded-2xl border border-gray-100">
+                    <div className="space-y-0.5">
+                      <label htmlFor="sett_enableNotif" className="text-xs font-bold text-gray-800 block cursor-pointer">
+                        تفعيل التنبيهات العامة بالتطبيق
+                      </label>
+                      <span className="text-[10px] text-gray-500 block">السماح للتطبيق بإرسال التنبيهات المنبثقة</span>
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      id="sett_enableNotif" 
+                      checked={userProfile.enableNotifications !== false}
+                      onChange={(e) => {
+                        const updated = { ...state, profile: { ...userProfile, enableNotifications: e.target.checked } };
+                        updateState(updated);
+                        if (e.target.checked && notifPermission !== "granted") {
+                          handleRequestNotifPermission();
+                        }
+                      }}
+                      className="w-5 h-5 text-emerald-600 border-gray-300 rounded focus:ring-emerald-500 cursor-pointer" 
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between p-3 bg-gray-50 rounded-2xl border border-gray-100">
+                    <div className="space-y-0.5">
+                      <label htmlFor="sett_notifyPrayer" className="text-xs font-bold text-gray-800 block cursor-pointer">
+                        تنبيهات أوقات الصلوات الخمس والأذان
+                      </label>
+                      <span className="text-[10px] text-gray-500 block">التذكير لدخول وقت الصلاة حسب موقعك الجغرافي</span>
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      id="sett_notifyPrayer" 
+                      checked={userProfile.notifyPrayerTimes !== false}
+                      onChange={(e) => {
+                        const updated = { ...state, profile: { ...userProfile, notifyPrayerTimes: e.target.checked } };
+                        updateState(updated);
+                      }}
+                      className="w-5 h-5 text-emerald-600 border-gray-300 rounded focus:ring-emerald-500 cursor-pointer" 
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between p-3 bg-gray-50 rounded-2xl border border-gray-100">
+                    <div className="space-y-0.5">
+                      <label htmlFor="sett_notifyReview" className="text-xs font-bold text-gray-800 block cursor-pointer">
+                        تنبيهات ورد الحفظ والتكرار المتباعد
+                      </label>
+                      <span className="text-[10px] text-gray-500 block">تذكير يومي بالمراجعات المقررة والمجموعات التراكمية</span>
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      id="sett_notifyReview" 
+                      checked={userProfile.notifyReviewReminder !== false}
+                      onChange={(e) => {
+                        const updated = { ...state, profile: { ...userProfile, notifyReviewReminder: e.target.checked } };
+                        updateState(updated);
+                      }}
+                      className="w-5 h-5 text-emerald-600 border-gray-300 rounded focus:ring-emerald-500 cursor-pointer" 
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Prayer Reminder Offset Customization Card */}
+              <div className="bg-white rounded-3xl p-6 shadow-sm border border-emerald-500/10 space-y-5">
+                <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-2.5 bg-amber-50 text-amber-700 rounded-2xl shadow-sm border border-amber-100">
+                      <Clock className="w-5 h-5 shrink-0" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-serif font-bold text-emerald-900">
+                        ⏰ وقت التذكير المفضل لمراجعة ورد الصلاة
+                      </h3>
+                      <p className="text-xs text-gray-500">
+                        ضبط الموعد المفضل للتنبيه قبل كل صلاة لمراجعة الآيات المحددة لركعاتها قبل الأذان
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Master Toggle */}
+                  <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                    <input 
+                      type="checkbox" 
+                      id="sett_notifyPrayerReviewBefore"
+                      checked={userProfile.notifyPrayerReviewBefore !== false}
+                      onChange={(e) => {
+                        const updated = { ...state, profile: { ...userProfile, notifyPrayerReviewBefore: e.target.checked } };
+                        updateState(updated);
+                      }}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-800"></div>
+                  </label>
+                </div>
+
+                {/* Quick Global Offset Selector */}
+                <div className="p-4 bg-emerald-50/50 rounded-2xl border border-emerald-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <span className="text-xs font-bold text-emerald-950 block">وقت التذكير المفضل لجميع الصلوات (افتراضي عام)</span>
+                    <span className="text-[11px] text-gray-600 block">تطبيق موعد تذكير موحد قبل موعد الأذان بطلبك (مثلاً قبل الصلاة بـ 15 دقيقة)</span>
+                  </div>
+
+                  <select
+                    value={userProfile.prayerReminderOffsetMinutes || 15}
+                    onChange={(e) => {
+                      const minutes = Number(e.target.value);
+                      const updatedOffsets = {
+                        fajr: minutes,
+                        dhuhr: minutes,
+                        asr: minutes,
+                        maghrib: minutes,
+                        isha: minutes
+                      };
+                      const updated = { 
+                        ...state, 
+                        profile: { 
+                          ...userProfile, 
+                          prayerReminderOffsetMinutes: minutes,
+                          prayerReminderOffsets: updatedOffsets
+                        } 
+                      };
+                      updateState(updated);
+                    }}
+                    className="px-3 py-2 bg-white border border-emerald-200 rounded-xl text-xs font-bold text-emerald-900 focus:outline-none focus:ring-2 focus:ring-emerald-600 shadow-2xs shrink-0 cursor-pointer"
+                  >
+                    <option value="5">قبل الصلاة بـ 5 دقائق</option>
+                    <option value="10">قبل الصلاة بـ 10 دقائق</option>
+                    <option value="15">قبل الصلاة بـ 15 دقيقة (المستحسن)</option>
+                    <option value="20">قبل الصلاة بـ 20 دقيقة</option>
+                    <option value="30">قبل الصلاة بـ 30 دقيقة</option>
+                    <option value="45">قبل الصلاة بـ 45 دقيقة</option>
+                  </select>
+                </div>
+
+                {/* Individual Prayer Time Adjusters */}
+                <div className="space-y-3">
+                  <h4 className="text-xs font-bold text-gray-700 font-serif">
+                    تخصيص وقت التذكير لكل صلاة من الصلوات الخمس بشكل مستقل:
+                  </h4>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {[
+                      { key: "fajr", name: "صلاة الفجر", icon: "🌅", arabic: "الفجر" },
+                      { key: "dhuhr", name: "صلاة الظهر", icon: "☀️", arabic: "الظهر" },
+                      { key: "asr", name: "صلاة العصر", icon: "🌤️", arabic: "العصر" },
+                      { key: "maghrib", name: "صلاة المغرب", icon: "🌅", arabic: "المغرب" },
+                      { key: "isha", name: "صلاة العشاء", icon: "🌙", arabic: "العشاء" }
+                    ].map((p) => {
+                      const prayerInfo = prayerTimesList.find(pt => pt.arabicName === p.arabic);
+                      const currentOffset = userProfile.prayerReminderOffsets?.[p.key as keyof typeof userProfile.prayerReminderOffsets] ?? userProfile.prayerReminderOffsetMinutes ?? 15;
+                      
+                      let reminderTimeStr = "";
+                      if (prayerInfo?.time) {
+                        const remDate = new Date(prayerInfo.time.getTime() - currentOffset * 60 * 1000);
+                        reminderTimeStr = remDate.toLocaleTimeString("ar-EG", { hour: "numeric", minute: "2-digit", hour12: true });
+                      }
+
+                      return (
+                        <div key={p.key} className="p-3.5 bg-gray-50/80 rounded-2xl border border-gray-200/80 space-y-2.5">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className="text-lg">{p.icon}</span>
+                              <span className="text-xs font-bold text-gray-900">{p.name}</span>
+                            </div>
+                            <span className="text-[10px] font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-lg border border-emerald-100">
+                              موعد الصلاة: {prayerInfo?.time ? prayerInfo.time.toLocaleTimeString("ar-EG", { hour: "numeric", minute: "2-digit", hour12: true }) : ""}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] text-gray-600 font-medium">التنبيه قبل الصلاة بـ:</span>
+                            <select
+                              value={currentOffset}
+                              onChange={(e) => {
+                                const val = Number(e.target.value);
+                                const updatedOffsets = {
+                                  ...(userProfile.prayerReminderOffsets || { fajr: 15, dhuhr: 15, asr: 15, maghrib: 15, isha: 15 }),
+                                  [p.key]: val
+                                };
+                                const updated = {
+                                  ...state,
+                                  profile: {
+                                    ...userProfile,
+                                    prayerReminderOffsets: updatedOffsets
+                                  }
+                                };
+                                updateState(updated);
+                              }}
+                              className="px-2.5 py-1.5 bg-white border border-gray-300 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-emerald-600 cursor-pointer"
+                            >
+                              <option value="5">5 دقائق قبل الصلاة</option>
+                              <option value="10">10 دقائق قبل الصلاة</option>
+                              <option value="15">15 دقيقة قبل الصلاة</option>
+                              <option value="20">20 دقيقة قبل الصلاة</option>
+                              <option value="30">30 دقيقة قبل الصلاة</option>
+                              <option value="45">45 دقيقة قبل الصلاة</option>
+                            </select>
+                          </div>
+
+                          <div className="pt-2 border-t border-gray-200/60 flex items-center justify-between text-[10px]">
+                            <span className="text-gray-600">
+                              ⏰ موعد التذكير الموعد: <strong className="text-emerald-900 font-bold">{reminderTimeStr}</strong>
+                            </span>
+
+                            <button
+                              type="button"
+                              onClick={() => handleTestPrayerReminderNotification(p.arabic, distributionSlots)}
+                              className="text-emerald-800 hover:text-emerald-950 font-bold underline flex items-center gap-1 cursor-pointer"
+                            >
+                              اختبار التنبيه 🔔
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
               {/* Data Sync & Diagnostics Logs */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 
@@ -1627,37 +3272,6 @@ export default function App() {
                         className="hidden" 
                       />
                     </label>
-                  </div>
-
-                  <div className="pt-4 border-t border-gray-100">
-                    <h4 className="text-sm font-bold text-gray-700 mb-2">🔔 تجربة النظام</h4>
-                    <button
-                      onClick={async () => {
-                        const result = await sendTestNotification();
-                        if (result === "sent") {
-                          alert("✅ تم إرسال الإشعار! ابحث عنه في منطقة الإشعارات.");
-                        } else if (result === "iframe") {
-                          alert(
-                            "⚠️ الإشعارات لا تعمل في نافذة المعاينة المضمّنة.\n\n" +
-                            "افتح التطبيق في تبويب متصفح مستقل ثم جرّب مجدداً.\n" +
-                            "(انقر على زر فتح في نافذة جديدة أعلى المعاينة)"
-                          );
-                        } else if (result === "denied") {
-                          alert(
-                            "🔕 الإشعارات محظورة.\n\n" +
-                            "انقر على أيقونة القفل بجانب رابط الصفحة في المتصفح، وأعطِ إذن الإشعارات."
-                          );
-                        } else if (result === "unsupported") {
-                          alert("❌ متصفحك لا يدعم الإشعارات. جرّب Chrome أو Edge.");
-                        } else {
-                          alert("❌ فشل إرسال الإشعار. يرجى المحاولة مرة أخرى.");
-                        }
-                      }}
-                      className="w-full py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 border border-blue-200"
-                    >
-                      <Bell className="w-4 h-4" />
-                      تجربة الإشعارات
-                    </button>
                   </div>
 
                   <button 

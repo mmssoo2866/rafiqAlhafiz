@@ -1,13 +1,8 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 
-const rawPort = process.env["PORT"];
-
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
-}
+// PORT اختياري — القيمة الافتراضية 3001 للتشغيل المحلي
+const rawPort = process.env["PORT"] ?? "3001";
 
 const port = Number(rawPort);
 
@@ -21,5 +16,5 @@ app.listen(port, (err) => {
     process.exit(1);
   }
 
-  logger.info({ port }, "Server listening");
+  logger.info({ port }, `Server listening on http://localhost:${port}`);
 });

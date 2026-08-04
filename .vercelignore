@@ -1,0 +1,16 @@
+node_modules
+.local
+.git
+.artifacts
+.agents
+.idea
+dist
+tmp
+out-tsc
+*.tsbuildinfo
+.expo
+.expo-shared
+artifacts/**/node_modules
+lib/**/node_modules
+scripts/node_modules
+attached_assets

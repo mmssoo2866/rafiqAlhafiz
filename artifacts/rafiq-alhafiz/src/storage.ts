@@ -12,6 +12,32 @@ export interface UserProfile {
   autoOpenMushaf: boolean;
   streakDays: number;
   lastActiveDate: string; // YYYY-MM-DD
+  enableNotifications?: boolean;
+  notifyPrayerTimes?: boolean;
+  notifyReviewReminder?: boolean;
+  notifyPrayerReviewBefore?: boolean;
+  prayerReminderOffsetMinutes?: number;
+  prayerReminderOffsets?: {
+    fajr?: number;
+    dhuhr?: number;
+    asr?: number;
+    maghrib?: number;
+    isha?: number;
+  };
+  mushafNightMode?: boolean;
+  duhaRakats?: number;
+  appTrack?: "hifz_and_review" | "review_only";
+  reviewOnlyDirection?: "forward" | "backward";
+  reviewOnlyDailyAmountType?: "pages" | "hizb" | "juz" | "surah_ayah";
+  reviewOnlyDailyAmountValue?: number;
+  reviewOnlySurahId?: number;
+  reviewOnlyFromAyah?: number;
+  reviewOnlyToAyah?: number;
+  reviewOnlyCurrentPage?: number;
+  reviewOnlyCompletedDates?: string[];
+  mainReviewStartSurahId?: number;
+  mainReviewEndSurahId?: number;
+  mainReviewProgressPages?: number;
 }
 
 export interface MemorizationBlock {
@@ -44,7 +70,7 @@ export interface AppState {
 const STORAGE_KEY = "rafiq_alhafiz_state_v1";
 
 const DEFAULT_PROFILE: UserProfile = {
-  name: "عبد الله",
+  name: "الاسم",
   gender: "male",
   prayerRole: "imam",
   nightPrayerRakats: 8,
@@ -54,7 +80,33 @@ const DEFAULT_PROFILE: UserProfile = {
   memorizationDirection: "forward",
   autoOpenMushaf: true,
   streakDays: 3,
-  lastActiveDate: new Date().toISOString().split("T")[0]
+  lastActiveDate: new Date().toISOString().split("T")[0],
+  enableNotifications: true,
+  notifyPrayerTimes: true,
+  notifyReviewReminder: true,
+  notifyPrayerReviewBefore: true,
+  prayerReminderOffsetMinutes: 15,
+  prayerReminderOffsets: {
+    fajr: 15,
+    dhuhr: 15,
+    asr: 15,
+    maghrib: 15,
+    isha: 15
+  },
+  mushafNightMode: false,
+  duhaRakats: 4,
+  appTrack: "hifz_and_review",
+  reviewOnlyDirection: "forward",
+  reviewOnlyDailyAmountType: "juz",
+  reviewOnlyDailyAmountValue: 20,
+  reviewOnlySurahId: 2,
+  reviewOnlyFromAyah: 1,
+  reviewOnlyToAyah: 100,
+  reviewOnlyCurrentPage: 1,
+  reviewOnlyCompletedDates: [],
+  mainReviewStartSurahId: 114,
+  mainReviewEndSurahId: 18,
+  mainReviewProgressPages: 0
 };
 
 // Generates some mock completed and pending blocks for first-time use

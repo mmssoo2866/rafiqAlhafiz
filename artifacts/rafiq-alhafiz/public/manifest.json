@@ -1,0 +1,17 @@
+{
+  "name": "رفيق الحافظ",
+  "short_name": "رفيق الحافظ",
+  "description": "تطبيق رفيق الحافظ لمراجعة وحفظ القرآن الكريم",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#065f46",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

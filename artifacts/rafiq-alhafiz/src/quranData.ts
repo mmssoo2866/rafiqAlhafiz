@@ -97,30 +97,30 @@ export const SURAHS: SurahInfo[] = [
   { id: 88, name: "الغاشية", english: "Al-Ghashiyah", ayahs: 26, startPage: 597 },
   { id: 89, name: "الفجر", english: "Al-Fajr", ayahs: 30, startPage: 597 },
   { id: 90, name: "البلد", english: "Al-Balad", ayahs: 20, startPage: 599 },
-  { id: 91, name: "الشمس", english: "Ash-Shams", ayahs: 15, startPage: 600 },
-  { id: 92, name: "الليل", english: "Al-Layl", ayahs: 21, startPage: 600 },
+  { id: 91, name: "الشمس", english: "Ash-Shams", ayahs: 15, startPage: 601 },
+  { id: 92, name: "الليل", english: "Al-Layl", ayahs: 21, startPage: 601 },
   { id: 93, name: "الضحى", english: "Ad-Duha", ayahs: 11, startPage: 602 },
   { id: 94, name: "الشرح", english: "Ash-Sharh", ayahs: 8, startPage: 602 },
   { id: 95, name: "التين", english: "At-Tin", ayahs: 8, startPage: 603 },
   { id: 96, name: "العلق", english: "Al-Alaq", ayahs: 19, startPage: 603 },
   { id: 97, name: "القدر", english: "Al-Qadr", ayahs: 5, startPage: 604 },
-  { id: 98, name: "البينة", english: "Al-Bayyinah", ayahs: 8, startPage: 598 },
-  { id: 99, name: "الزلزلة", english: "Az-Zalzalah", ayahs: 8, startPage: 599 },
-  { id: 100, name: "العاديات", english: "Al-Adiyat", ayahs: 11, startPage: 599 },
-  { id: 101, name: "القارعة", english: "Al-Qari'ah", ayahs: 11, startPage: 600 },
-  { id: 102, name: "التكاثر", english: "At-Taka-thur", ayahs: 8, startPage: 600 },
-  { id: 103, name: "العصر", english: "Al-Asr", ayahs: 3, startPage: 601 },
-  { id: 104, name: "الهمزة", english: "Al-Humazah", ayahs: 9, startPage: 601 },
-  { id: 105, name: "الفيل", english: "Al-Fil", ayahs: 5, startPage: 601 },
-  { id: 106, name: "قريش", english: "Quraysh", ayahs: 4, startPage: 602 },
-  { id: 107, name: "الماعون", english: "Al-Ma'un", ayahs: 7, startPage: 602 },
-  { id: 108, name: "الكوثر", english: "Al-Kawthar", ayahs: 3, startPage: 602 },
-  { id: 109, name: "الكافرون", english: "Al-Kafirun", ayahs: 6, startPage: 603 },
-  { id: 110, name: "النصر", english: "An-Nasr", ayahs: 3, startPage: 603 },
-  { id: 111, name: "المسد", english: "Al-Masad", ayahs: 5, startPage: 603 },
-  { id: 112, name: "الإخلاص", english: "Al-Ikhlas", ayahs: 4, startPage: 604 },
-  { id: 113, name: "الفلق", english: "Al-Falaq", ayahs: 5, startPage: 604 },
-  { id: 114, name: "الناس", english: "An-Nas", ayahs: 6, startPage: 604 }
+  { id: 98, name: "البينة", english: "Al-Bayyinah", ayahs: 8, startPage: 604 },
+  { id: 99, name: "الزلزلة", english: "Az-Zalzalah", ayahs: 8, startPage: 605 },
+  { id: 100, name: "العاديات", english: "Al-Adiyat", ayahs: 11, startPage: 605 },
+  { id: 101, name: "القارعة", english: "Al-Qari'ah", ayahs: 11, startPage: 606 },
+  { id: 102, name: "التكاثر", english: "At-Taka-thur", ayahs: 8, startPage: 606 },
+  { id: 103, name: "العصر", english: "Al-Asr", ayahs: 3, startPage: 607 },
+  { id: 104, name: "الهمزة", english: "Al-Humazah", ayahs: 9, startPage: 607 },
+  { id: 105, name: "الفيل", english: "Al-Fil", ayahs: 5, startPage: 608 },
+  { id: 106, name: "قريش", english: "Quraysh", ayahs: 4, startPage: 608 },
+  { id: 107, name: "الماعون", english: "Al-Ma'un", ayahs: 7, startPage: 608 },
+  { id: 108, name: "الكوثر", english: "Al-Kawthar", ayahs: 3, startPage: 608 },
+  { id: 109, name: "الكافرون", english: "Al-Kafirun", ayahs: 6, startPage: 609 },
+  { id: 110, name: "النصر", english: "An-Nasr", ayahs: 3, startPage: 609 },
+  { id: 111, name: "المسد", english: "Al-Masad", ayahs: 5, startPage: 610 },
+  { id: 112, name: "الإخلاص", english: "Al-Ikhlas", ayahs: 4, startPage: 610 },
+  { id: 113, name: "الفلق", english: "Al-Falaq", ayahs: 5, startPage: 610 },
+  { id: 114, name: "الناس", english: "An-Nas", ayahs: 6, startPage: 610 }
 ];
 
 export function getSurahById(id: number): SurahInfo | undefined {
@@ -148,4 +148,17 @@ export function getPageForAyah(surahId: number, ayahNum: number): number {
 
   // Restrict to standard Quran 604 pages max
   return Math.max(1, Math.min(604, targetPage));
+}
+
+export function getSurahForPage(page: number): string {
+  const pageNum = Math.max(1, Math.min(604, page));
+  let found = SURAHS[0];
+  for (let i = 0; i < SURAHS.length; i++) {
+    if (SURAHS[i].startPage <= pageNum) {
+      found = SURAHS[i];
+    } else {
+      break;
+    }
+  }
+  return found.name;
 }
