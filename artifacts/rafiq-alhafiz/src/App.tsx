@@ -867,7 +867,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-xl md:text-2xl font-bold font-serif tracking-tight text-white flex items-center gap-2">
-                رفيق الحافظ <span className="text-[10px] md:text-xs px-2 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full font-sans font-normal">v1.0.0</span>
+                رفيق الحافظ <span className="text-[10px] md:text-xs px-2 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full font-sans font-normal">v2.0.0</span>
               </h1>
               <p className="text-xs text-emerald-200">الجدولة التفاعلية والمراجعة المدمجة بالصلوات وتكرار الحفظ</p>
             </div>
